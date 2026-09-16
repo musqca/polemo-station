@@ -1,0 +1,35 @@
+port: 20156
+stationId: "polemo-station-dev"
+stationPairingToken: ""
+stationPublicBaseUrl: "http://192.168.31.129:20156"
+# Optional external FFmpeg path. Leave empty to use FFmpeg from PATH.
+stationFFmpegPath: ""
+stationTranscodeProfiles:
+  balanced:
+    codec: aac
+    container: mp4
+    bitrate: 256000
+    sampleRate: 48000
+    channels: 2
+    version: 1
+  mobile:
+    codec: aac
+    container: mp4
+    bitrate: 192000
+    sampleRate: 48000
+    channels: 2
+    version: 1
+# Only these server directories may be browsed and added as local media 
+# sources. Add your music mount points here, for example /Volumes/Music.
+stationMediaRoots: []
+devMode: true
+jwtSecurity: 89cbd93feccfd77edc623cd3db512f0d
+jwtLifetime: 30d
+log:
+  logFile: app.log
+  logPath: logs
+  maxSize: 200
+  maxBackups: 3
+  maxAge: 30
+  compress: true
+  useCaller: true
