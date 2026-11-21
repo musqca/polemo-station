@@ -16,9 +16,10 @@ import (
 )
 
 var supportedAudioExtensions = map[string]bool{
-	".mp3": true, ".flac": true, ".wav": true, ".m4a": true,
+	".mp3": true, ".flac": true, ".wav": true, ".w64": true, ".m4a": true,
 	".aac": true, ".ogg": true, ".opus": true, ".wma": true,
 	".ape": true, ".aiff": true, ".aif": true, ".dsf": true,
+	".iso": true, ".m2ts": true, ".vob": true, ".mka": true, ".m4b": true,
 }
 
 const (

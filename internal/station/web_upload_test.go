@@ -41,3 +41,44 @@ func TestImportWebUploadRejectsNonAudioExtension(t *testing.T) {
 		t.Fatal("expected unsupported extension to be rejected")
 	}
 }
+
+func TestImportWebUploadAcceptsWave64(t *testing.T) {
+	service := newTransferTestService(t)
+	file, err := service.ImportWebUpload("Song.W64", bytes.NewReader(deterministicFixture(1024)))
+	if err != nil {
+		t.Fatalf("Wave64 upload rejected: %v", err)
+	}
+	if file.Format != "W64" {
+		t.Fatalf("got format %q, want W64", file.Format)
+	}
+}
+
+func TestImportWebUploadAcceptsVob(t *testing.T) {
+	service := newTransferTestService(t)
+	file, err := service.ImportWebUpload("Concert.VOB", bytes.NewReader(deterministicFixture(1024)))
+	if err != nil {
+		t.Fatalf("VOB upload rejected: %v", err)
+	}
+	if file.Format != "VOB" {
+		t.Fatalf("got format %q, want VOB", file.Format)
+	}
+}
+
+func TestImportWebUploadAcceptsMkaAndM4b(t *testing.T) {
+	service := newTransferTestService(t)
+	f1, err := service.ImportWebUpload("Album.MKA", bytes.NewReader(deterministicFixture(1024)))
+	if err != nil {
+		t.Fatalf("MKA upload rejected: %v", err)
+	}
+	if f1.Format != "MKA" {
+		t.Fatalf("got format %q, want MKA", f1.Format)
+	}
+
+	f2, err := service.ImportWebUpload("Book.m4b", bytes.NewReader(deterministicFixture(2048)))
+	if err != nil {
+		t.Fatalf("M4B upload rejected: %v", err)
+	}
+	if f2.Format != "M4B" {
+		t.Fatalf("got format %q, want M4B", f2.Format)
+	}
+}

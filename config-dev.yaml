@@ -1,7 +1,7 @@
 port: 20156
 stationId: "polemo-station-dev"
 stationPairingToken: ""
-stationPublicBaseUrl: "http://192.168.31.129:20156"
+stationPublicBaseUrl: "http://192.168.10.45:20156"
 # Optional external FFmpeg path. Leave empty to use FFmpeg from PATH.
 stationFFmpegPath: ""
 stationTranscodeProfiles:
