@@ -16,7 +16,7 @@ func TestDiscogsOAuthCallbackRedirectsUnboundRequest(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, station.DiscogsOAuthCallbackPath+"?oauth_token=fixture&oauth_verifier=unbound", nil)
 	response := httptest.NewRecorder()
 	engine.ServeHTTP(response, request)
-	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/en-US/authorization/providers?discogsOAuth=failed" {
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/en-US/tasks?discogsOAuth=failed#metadata" {
 		t.Fatalf("unexpected callback response: status=%d location=%s", response.Code, response.Header().Get("Location"))
 	}
 	if response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("Referrer-Policy") != "no-referrer" {

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 )
 
 var scrapeProviders = []string{discogsProvider, "musicbrainz", "coverartarchive", "fanarttv", "lrclib", "theaudiodb"}
+var musicBrainzUnfinishedStates = []string{ScrapePending, ScrapeRetry, ScrapeRunning, ScrapePaused}
 var errScrapeDependency = errors.New("scrape dependency is not ready")
 var errScrapeProviderDisabled = errors.New("scrape provider is disabled")
 
@@ -132,39 +134,35 @@ func (s *Service) claimScrapeItem() (*ScrapeItem, error) {
 			return err
 		}
 		enabled := make(map[string]bool, len(configs))
+		musicBrainzEnabled := false
 		for _, config := range configs {
 			enabled[config.Provider] = !config.Paused
-		}
-		stagedProvider := ""
-		for _, candidate := range scrapeProviders {
-			if candidate == discogsProvider || !enabled[candidate] {
-				continue
-			}
-			var activeCount int64
-			if err := tx.Model(&ScrapeItem{}).Where("provider = ? AND state IN ?", candidate, []string{ScrapePending, ScrapeRetry, ScrapeRunning}).Count(&activeCount).Error; err != nil {
-				return err
-			}
-			if activeCount > 0 {
-				stagedProvider = candidate
-				break
+			if config.Provider == "musicbrainz" {
+				musicBrainzEnabled = true
 			}
 		}
-		// Discogs can take a turn whenever the ordered stages have no ready work.
-		// When both are ready, alternate so neither side can starve the other.
-		order := [2]string{discogsProvider, stagedProvider}
 		s.scrapeRateMu.Lock()
-		if s.lastScrapeProvider == discogsProvider {
-			order[0], order[1] = order[1], order[0]
-		}
+		start := slices.Index(scrapeProviders, s.lastScrapeProvider) + 1
 		s.scrapeRateMu.Unlock()
-		for _, provider := range order {
+		for offset := range scrapeProviders {
+			provider := scrapeProviders[(start+offset)%len(scrapeProviders)]
 			if !enabled[provider] || !s.scrapeProviderReady(provider, now) {
 				continue
 			}
-			err := tx.Where("provider = ?", provider).
+			query := tx.Where("provider = ?", provider).
 				Where("state IN ? AND (next_retry_at IS NULL OR next_retry_at <= ?) AND failure_count < ?", []string{ScrapePending, ScrapeRetry}, now, settings.MaxFailures).
-				Where("(lease_until IS NULL OR lease_until < ?)", now).
-				Order("created_at asc").First(&item).Error
+				Where("(lease_until IS NULL OR lease_until < ?)", now)
+			if musicBrainzEnabled && (provider == "coverartarchive" || provider == "fanarttv") {
+				// Skip only covers whose own MusicBrainz task still owes them an ID.
+				query = query.Where(`
+					TRIM(COALESCE(scrape_items.external_id, '')) <> '' OR NOT EXISTS (
+						SELECT 1 FROM scrape_items AS mb
+						WHERE mb.server_file_id = scrape_items.server_file_id
+							AND mb.provider = 'musicbrainz' AND mb.state IN ?
+							AND TRIM(COALESCE(CASE WHEN ? = 'fanarttv' THEN mb.related_external_id ELSE mb.external_id END, '')) = ''
+					)`, musicBrainzUnfinishedStates, provider)
+			}
+			err := query.Order("created_at asc").First(&item).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				continue
 			}
@@ -198,13 +196,13 @@ func (s *Service) scrapeProviderReady(provider string, now time.Time) bool {
 func (s *Service) noteScrapeRequest(provider string, now time.Time) {
 	interval := 1500 * time.Millisecond
 	if provider == "lrclib" {
-		interval = 100 * time.Millisecond
-	}
-	if provider == "theaudiodb" {
-		interval = 2 * time.Second
+		interval = 500 * time.Millisecond
 	}
 	s.scrapeRateMu.Lock()
-	s.scrapeProviderNext[provider] = now.Add(interval)
+	// TheAudioDB reserves one slot per album request, including multiple albums for one song.
+	if provider != "theaudiodb" {
+		s.scrapeProviderNext[provider] = now.Add(interval)
+	}
 	s.lastScrapeProvider = provider
 	s.scrapeRateMu.Unlock()
 }
@@ -368,21 +366,8 @@ func (s *Service) scrapeCoverArt(ctx context.Context, item *ScrapeItem, settings
 	if !config.Enabled {
 		return errScrapeProviderDisabled
 	}
-	if strings.TrimSpace(item.ExternalID) == "" {
-		var musicbrainzItem ScrapeItem
-		if err := s.db.Where("server_file_id = ? AND provider = ?", item.ServerFileID, "musicbrainz").First(&musicbrainzItem).Error; err == nil {
-			if strings.TrimSpace(musicbrainzItem.ExternalID) != "" {
-				item.ExternalID = musicbrainzItem.ExternalID
-				if item.ID != 0 {
-					_ = s.db.Model(&ScrapeItem{}).Where("id = ?", item.ID).Update("external_id", item.ExternalID).Error
-				}
-			} else if musicbrainzItem.State == ScrapePending || musicbrainzItem.State == ScrapeRunning || musicbrainzItem.State == ScrapeRetry {
-				return errScrapeDependency
-			}
-		}
-		if strings.TrimSpace(item.ExternalID) == "" {
-			return coverartarchive.ErrNoCover
-		}
+	if err := s.resolveScrapeCoverID(item, coverartarchive.ErrNoCover); err != nil {
+		return err
 	}
 	httpClient, baseURL := s.scrapeProviderHTTP("coverartarchive")
 	clientOptions := []coverartarchive.Option{coverartarchive.WithTimeout(time.Duration(settings.RequestTimeoutSeconds) * time.Second)}
@@ -416,11 +401,8 @@ func (s *Service) scrapeFanartTV(ctx context.Context, item *ScrapeItem, settings
 		return errors.New("fanart.tv API key is required")
 	}
 	httpClient, baseURL := s.scrapeProviderHTTP("fanarttv")
-	if strings.TrimSpace(item.ExternalID) == "" {
-		if err := s.ensureFanartMusicBrainzReleaseGroups(); err != nil {
-			return err
-		}
-		return errScrapeDependency
+	if err := s.resolveScrapeCoverID(item, fanarttv.ErrNoCover); err != nil {
+		return err
 	}
 	options := []fanarttv.Option{fanarttv.WithTimeout(time.Duration(settings.RequestTimeoutSeconds) * time.Second), fanarttv.WithAPIKey(config.APIKey)}
 	if httpClient != nil {
@@ -439,6 +421,47 @@ func (s *Service) scrapeFanartTV(ctx context.Context, item *ScrapeItem, settings
 	}
 	item.AddedCount += added
 	return nil
+}
+
+func (s *Service) resolveScrapeCoverID(item *ScrapeItem, noCover error) error {
+	if strings.TrimSpace(item.ExternalID) != "" {
+		return nil
+	}
+	var musicBrainzItem ScrapeItem
+	err := s.db.Where("server_file_id = ? AND provider = ?", item.ServerFileID, "musicbrainz").First(&musicBrainzItem).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return noCover
+	}
+	if err != nil {
+		return err
+	}
+	item.ExternalID = strings.TrimSpace(musicBrainzItem.ExternalID)
+	if item.Provider == "fanarttv" {
+		item.ExternalID = strings.TrimSpace(musicBrainzItem.RelatedExternalID)
+	}
+	if item.ExternalID != "" {
+		if item.ID != 0 {
+			return s.db.Model(item).Update("external_id", item.ExternalID).Error
+		}
+		return nil
+	}
+	config, err := s.providerConfig("musicbrainz")
+	if err != nil {
+		return err
+	}
+	if !config.Enabled {
+		return noCover
+	}
+	if slices.Contains(musicBrainzUnfinishedStates, musicBrainzItem.State) {
+		return errScrapeDependency
+	}
+	if item.Provider == "fanarttv" && !config.Paused && musicBrainzItem.State == ScrapeSuccess && musicBrainzItem.ExternalID != "" {
+		if err := s.ensureFanartMusicBrainzReleaseGroups(); err != nil {
+			return err
+		}
+		return errScrapeDependency
+	}
+	return noCover
 }
 
 func (s *Service) finishScrapeWaiting(item *ScrapeItem) error {
@@ -485,18 +508,14 @@ func (s *Service) scrapeLyrics(ctx context.Context, item *ScrapeItem, settings S
 	if err != nil {
 		return err
 	}
-	if title == "" || artist == "" {
+	if title == "" {
 		return lrclib.ErrInvalidQuery
 	}
-	httpClient, baseURL := s.scrapeProviderHTTP("lrclib")
-	clientOptions := []lrclib.Option{lrclib.WithTimeout(time.Duration(settings.RequestTimeoutSeconds) * time.Second)}
-	if httpClient != nil {
-		clientOptions = append(clientOptions, lrclib.WithHTTPClient(httpClient))
+	client := s.newLyricsClient(settings)
+	if artist == "" {
+		return s.scrapeLyricsByTitle(ctx, item, client, title, album)
 	}
-	if baseURL != "" {
-		clientOptions = append(clientOptions, lrclib.WithBaseURL(baseURL))
-	}
-	result, err := lrclib.NewClient(clientOptions...).Get(ctx, title, artist, album)
+	result, err := client.Get(ctx, title, artist, album)
 	if err != nil {
 		return err
 	}
@@ -529,12 +548,9 @@ func (s *Service) scrapeTheAudioDB(ctx context.Context, item *ScrapeItem, settin
 	if err := s.db.Where("server_file_id = ?", item.ServerFileID).First(&file).Error; err != nil {
 		return err
 	}
-	_, artist, album, err := s.lyricsQuery(file)
+	title, artist, album, err := s.lyricsQuery(file)
 	if err != nil {
 		return err
-	}
-	if artist == "" || album == "" {
-		return theaudiodb.ErrNoMatch
 	}
 	httpClient, baseURL := s.scrapeProviderHTTP("theaudiodb")
 	options := []theaudiodb.Option{theaudiodb.WithTimeout(time.Duration(settings.RequestTimeoutSeconds) * time.Second), theaudiodb.WithAPIKey(config.APIKey)}
@@ -544,7 +560,14 @@ func (s *Service) scrapeTheAudioDB(ctx context.Context, item *ScrapeItem, settin
 	if baseURL != "" {
 		options = append(options, theaudiodb.WithBaseURL(baseURL))
 	}
-	result, err := theaudiodb.NewClient(options...).Album(ctx, artist, album)
+	client := theaudiodb.NewClient(options...)
+	if artist == "" || album == "" {
+		if title == "" {
+			return theaudiodb.ErrNoMatch
+		}
+		return s.scrapeCoversByTitle(ctx, item, settings, client, title, artist, album)
+	}
+	result, err := s.fetchScrapeAlbum(ctx, client, artist, album)
 	if err != nil {
 		return err
 	}
@@ -564,12 +587,11 @@ func (s *Service) scrapeTheAudioDB(ctx context.Context, item *ScrapeItem, settin
 	return nil
 }
 
-// lyricsQuery uses the file's selected metadata first. When artist data is
-// missing, it may use MusicBrainz's scraped candidate only for the lookup.
-// Neither path writes to the immutable audio file or changes selected metadata.
+// lyricsQuery uses the file's selected metadata. A saved MusicBrainz result
+// is only needed when the file itself does not supply a title.
 func (s *Service) lyricsQuery(file ServerFile) (title, artist, album string, err error) {
 	title, artist, album = strings.TrimSpace(file.Title), strings.TrimSpace(file.Artist), strings.TrimSpace(file.Album)
-	if title != "" && artist != "" {
+	if title != "" {
 		return title, artist, album, nil
 	}
 	var resource MetadataResource
@@ -585,9 +607,7 @@ func (s *Service) lyricsQuery(file ServerFile) (title, artist, album string, err
 	if err := json.Unmarshal([]byte(resource.Data), &snapshot); err != nil {
 		return "", "", "", fmt.Errorf("decode musicbrainz metadata resource: %w", err)
 	}
-	if title == "" {
-		title = strings.TrimSpace(snapshot.Title)
-	}
+	title = strings.TrimSpace(snapshot.Title)
 	if artist == "" {
 		artist = strings.TrimSpace(snapshot.Artist)
 	}
@@ -597,8 +617,7 @@ func (s *Service) lyricsQuery(file ServerFile) (title, artist, album string, err
 	return title, artist, album, nil
 }
 
-// queueLyricsScrapeIfReady creates (or revives) an LRCLIB task only after a
-// usable query is available. It returns whether a task was created or revived.
+// queueLyricsScrapeIfReady creates or revives an LRCLIB task once a title is available.
 func (s *Service) queueLyricsScrapeIfReady(file ServerFile, settings ScrapeSettings) (bool, error) {
 	var config ThirdPartyProviderConfig
 	if err := s.db.Where("provider = ?", "lrclib").First(&config).Error; err != nil {
@@ -607,11 +626,11 @@ func (s *Service) queueLyricsScrapeIfReady(file ServerFile, settings ScrapeSetti
 	if !config.Enabled {
 		return false, nil
 	}
-	title, artist, _, err := s.lyricsQuery(file)
+	title, _, _, err := s.lyricsQuery(file)
 	if err != nil {
 		return false, err
 	}
-	if title == "" || artist == "" {
+	if title == "" {
 		return false, nil
 	}
 	var item ScrapeItem

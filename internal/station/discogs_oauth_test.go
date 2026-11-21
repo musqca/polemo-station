@@ -69,12 +69,12 @@ func TestDiscogsOAuthUsesVerifiedCallbackAndPreservesPersonalToken(t *testing.T)
 		t.Fatalf("callback cookie does not survive a safe cross-site redirect: %+v", cookies)
 	}
 	callback := httptest.NewRequest(http.MethodGet, "https://station.test/api/station/scrape/providers/discogs/oauth/callback?oauth_token=temporary-key&oauth_verifier=approved", nil)
-	if result := s.FinishDiscogsOAuth(httptest.NewRecorder(), callback); !strings.HasSuffix(result, "?discogsOAuth=failed") || len(requests) != 1 {
+	if result := s.FinishDiscogsOAuth(httptest.NewRecorder(), callback); !strings.HasSuffix(result, "?discogsOAuth=failed#metadata") || len(requests) != 1 {
 		t.Fatalf("unbound callback made a request: result=%s requests=%v", result, requests)
 	}
 	otherBrowser := callback.Clone(callback.Context())
 	otherBrowser.AddCookie(&http.Cookie{Name: cookies[0].Name, Value: "other-browser"})
-	if result := s.FinishDiscogsOAuth(httptest.NewRecorder(), otherBrowser); !strings.HasSuffix(result, "?discogsOAuth=failed") || len(requests) != 1 {
+	if result := s.FinishDiscogsOAuth(httptest.NewRecorder(), otherBrowser); !strings.HasSuffix(result, "?discogsOAuth=failed#metadata") || len(requests) != 1 {
 		t.Fatalf("another browser could finish the callback: result=%s requests=%v", result, requests)
 	}
 	jar, err := cookiejar.New(nil)
@@ -87,10 +87,10 @@ func TestDiscogsOAuthUsesVerifiedCallbackAndPreservesPersonalToken(t *testing.T)
 	for _, cookie := range jar.Cookies(publicCallback) {
 		callback.AddCookie(cookie)
 	}
-	if redirect := s.FinishDiscogsOAuth(httptest.NewRecorder(), callback); redirect != "/prefix/zh-CN/authorization/providers?discogsOAuth=connected" {
+	if redirect := s.FinishDiscogsOAuth(httptest.NewRecorder(), callback); redirect != "/prefix/zh-CN/tasks?discogsOAuth=connected#metadata" {
 		t.Fatalf("unexpected authorization callback redirect: %s", redirect)
 	}
-	if retry := s.FinishDiscogsOAuth(httptest.NewRecorder(), callback); !strings.HasSuffix(retry, "?discogsOAuth=failed") || len(requests) != 2 {
+	if retry := s.FinishDiscogsOAuth(httptest.NewRecorder(), callback); !strings.HasSuffix(retry, "?discogsOAuth=failed#metadata") || len(requests) != 2 {
 		t.Fatalf("callback could be replayed: result=%s requests=%v", retry, requests)
 	}
 	if err := s.TestScrapeProvider("discogs"); err != nil || len(requests) != 3 {

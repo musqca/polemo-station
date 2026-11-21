@@ -2,6 +2,7 @@ package router
 
 import (
 	"io/fs"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
@@ -100,18 +101,22 @@ func TestFrontendUnknownAssetIsNotFound(t *testing.T) {
 	}
 }
 
-func TestFrontendAuthorizationProvidersRoute(t *testing.T) {
-	if _, err := fs.Stat(frontend.Assets, "build/zh-CN/authorization/providers.html"); err != nil {
+func TestFrontendMetadataManagementLivesOnTasks(t *testing.T) {
+	if _, err := fs.Stat(frontend.Assets, "build/zh-CN/tasks.html"); err != nil {
 		t.Skip("full frontend build is not embedded; run make pkg")
 	}
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
 	Frontend(engine)
-	request := httptest.NewRequest("GET", "/zh-CN/authorization/providers", nil)
-	recorder := httptest.NewRecorder()
-	engine.ServeHTTP(recorder, request)
-	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), "<!doctype html>") {
-		t.Fatalf("authorization providers response = %d %q", recorder.Code, recorder.Body.String())
+	for path, status := range map[string]int{
+		"/zh-CN/tasks":                   http.StatusOK,
+		"/zh-CN/authorization/providers": http.StatusNotFound,
+	} {
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != status {
+			t.Fatalf("%s status = %d, want %d", path, recorder.Code, status)
+		}
 	}
 }
 

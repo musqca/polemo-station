@@ -2,6 +2,8 @@ package station
 
 import (
 	"encoding/json"
+	"io"
+	"strings"
 	"testing"
 )
 
@@ -15,8 +17,8 @@ func TestEnqueueScrapeCreatesProviderItemsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 3 { // TheAudioDB additionally requires an album.
-		t.Fatalf("created %d scrape items, want 3", count)
+	if count != 4 {
+		t.Fatalf("created %d scrape items, want 4", count)
 	}
 	count, err = service.EnqueueScrape([]string{file.ServerFileID})
 	if err != nil {
@@ -27,9 +29,9 @@ func TestEnqueueScrapeCreatesProviderItemsOnce(t *testing.T) {
 	}
 }
 
-func TestEnqueueScrapeDefersLyricsUntilMusicBrainzSuppliesArtist(t *testing.T) {
+func TestEnqueueScrapeDefersLyricsUntilThereIsATitle(t *testing.T) {
 	service := newTransferTestService(t)
-	file := ServerFile{ServerFileID: "sf1_deferred-lyrics", FileName: "song.flac", Title: "Song"}
+	file := ServerFile{ServerFileID: "sf1_deferred-lyrics", FileName: "song.flac"}
 	if err := service.db.Create(&file).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +44,7 @@ func TestEnqueueScrapeDefersLyricsUntilMusicBrainzSuppliesArtist(t *testing.T) {
 	}
 	var lyricsItem ScrapeItem
 	if err := service.db.Where("server_file_id = ? AND provider = ?", file.ServerFileID, "lrclib").First(&lyricsItem).Error; err == nil {
-		t.Fatalf("created LRCLIB task without an artist: %+v", lyricsItem)
+		t.Fatalf("created LRCLIB task without a title: %+v", lyricsItem)
 	}
 
 	data, err := json.Marshal(metadataSnapshot{Title: "Song", Artist: "Artist", Album: "Album"})
@@ -205,6 +207,13 @@ func TestScrapeDailyStatsAndSongs(t *testing.T) {
 	if _, err := service.appendScrapeCover(file.ServerFileID, []byte{0xff, 0xd8, 0xff, 0xd9}, "image/jpeg", "theaudiodb"); err != nil {
 		t.Fatal(err)
 	}
+	latestCover := "\xff\xd8\xff\xe0new cover"
+	if _, err := service.appendScrapeCover(file.ServerFileID, []byte(latestCover), "image/jpeg", "theaudiodb"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.appendScrapeCover(file.ServerFileID, []byte("\xff\xd8\xff\xe0other source"), "image/jpeg", "coverartarchive"); err != nil {
+		t.Fatal(err)
+	}
 
 	stats, err := service.ScrapeDailyStats()
 	if err != nil {
@@ -223,6 +232,29 @@ func TestScrapeDailyStatsAndSongs(t *testing.T) {
 	}
 	if len(songs) != 1 || songs[0].ServerFileID != file.ServerFileID || songs[0].Title != "Song" {
 		t.Fatalf("unexpected daily-stat songs: %+v", songs)
+	}
+	payload, err := json.Marshal(songs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row struct {
+		CoverURL string `json:"coverUrl"`
+	}
+	if err := json.Unmarshal(payload, &row); err != nil {
+		t.Fatal(err)
+	}
+	resourceID, ok := strings.CutPrefix(row.CoverURL, "/api/station/resources/")
+	if !ok || resourceID == "" {
+		t.Fatalf("expected a scraped cover URL, got %q", row.CoverURL)
+	}
+	cover, mime, err := service.OpenCover(resourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cover.Close()
+	data, err := io.ReadAll(cover)
+	if err != nil || mime != "image/jpeg" || string(data) != latestCover {
+		t.Fatalf("unexpected cover %q, mime=%s, err=%v", data, mime, err)
 	}
 	if _, err := service.ScrapeDailyStatSongs("unknown", "cover"); err == nil {
 		t.Fatal("invalid provider unexpectedly succeeded")

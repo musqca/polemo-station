@@ -176,9 +176,9 @@ func setDiscogsOAuthCookie(w http.ResponseWriter, callback *url.URL, value strin
 }
 
 func discogsOAuthReturn(base *url.URL, language, status string) string {
-	path := "/" + strings.TrimLeft(base.JoinPath(language, "authorization", "providers").Path, "/")
+	path := "/" + strings.TrimLeft(base.JoinPath(language, "tasks").Path, "/")
 	return (&url.URL{Path: path,
-		RawQuery: url.Values{"discogsOAuth": {status}}.Encode()}).String()
+		RawQuery: url.Values{"discogsOAuth": {status}}.Encode(), Fragment: "metadata"}).String()
 }
 
 func (s *Service) FinishDiscogsOAuth(w http.ResponseWriter, r *http.Request) string {

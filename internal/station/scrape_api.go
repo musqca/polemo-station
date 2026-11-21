@@ -34,9 +34,8 @@ func (s *Service) ScrapeSettingsView() (ScrapeSettingsView, error) {
 		var latest ScrapeRun
 		if err := s.db.Where("provider = ?", config.Provider).Order("created_at desc").First(&latest).Error; err == nil {
 			view.RunID, view.RunTotal, view.SkippedSuccess = latest.RunID, latest.Total, latest.SkippedSuccess
-			// A source can require fields that some library tracks do not have
-			// (for example, LRCLIB requires both title and artist). Such tracks do
-			// not get a queue item, but remain part of the full-library run total.
+			// Tracks without enough information for this provider remain part
+			// of the full-library run total without getting queue items.
 			// Expose that remainder explicitly so the progress partition always
 			// adds up to the displayed total.
 			var itemCount int64
@@ -63,6 +62,7 @@ type ScrapeDailyStatSong struct {
 	Title        string `json:"title"`
 	Artist       string `json:"artist"`
 	Album        string `json:"album"`
+	CoverURL     string `json:"coverUrl,omitempty"`
 }
 
 func scrapeTodayStart(now time.Time) time.Time {
@@ -86,11 +86,19 @@ func (s *Service) ScrapeDailyStatSongs(provider, kind string) ([]ScrapeDailyStat
 		return nil, errors.New("invalid scrape statistic")
 	}
 	items := []ScrapeDailyStatSong{}
+	latest := s.db.Table("metadata_resources").
+		Select("MAX(id) AS id").
+		Where("source = ? AND type = ? AND deleted = ? AND created_at >= ?", provider, kind, false, scrapeTodayStart(time.Now())).
+		Group("server_file_id")
+	columns := "files.server_file_id, files.file_name, files.relative_path, files.title, files.artist, files.album"
+	if kind == "cover" {
+		columns += ", '/api/station/resources/' || resources.resource_id AS cover_url"
+	}
 	err := s.db.Table("server_files AS files").
-		Select("files.server_file_id, files.file_name, files.relative_path, files.title, files.artist, files.album").
+		Select(columns).
 		Joins("JOIN metadata_resources AS resources ON resources.server_file_id = files.server_file_id").
-		Where("resources.source = ? AND resources.type = ? AND resources.deleted = ? AND resources.created_at >= ? AND files.deleted_at IS NULL", provider, kind, false, scrapeTodayStart(time.Now())).
-		Group("files.server_file_id, files.file_name, files.relative_path, files.title, files.artist, files.album").
+		Joins("JOIN (?) AS latest ON latest.id = resources.id", latest).
+		Where("files.deleted_at IS NULL").
 		Order("files.title, files.file_name").Scan(&items).Error
 	return items, err
 }
@@ -294,8 +302,6 @@ func (s *Service) EnqueueScrape(serverFileIDs []string) (int, error) {
 }
 
 func (s *Service) enqueueScrapeProvider(file ServerFile, config ThirdPartyProviderConfig, settings ScrapeSettings) (bool, error) {
-	// LRCLIB needs both a title and an artist. Do not leave a terminal no-match
-	// record for files that cannot yet form a query; MusicBrainz may later add it.
 	if config.Provider == "lrclib" {
 		return s.queueLyricsScrapeIfReady(file, settings)
 	}
@@ -306,11 +312,11 @@ func (s *Service) enqueueScrapeProvider(file ServerFile, config ThirdPartyProvid
 		}
 	}
 	if config.Provider == "theaudiodb" {
-		_, artist, album, err := s.lyricsQuery(file)
+		title, artist, album, err := s.lyricsQuery(file)
 		if err != nil {
 			return false, err
 		}
-		if artist == "" || album == "" {
+		if title == "" && (artist == "" || album == "") {
 			return false, nil
 		}
 	}
@@ -463,6 +469,10 @@ func (s *Service) ensureFanartMusicBrainzReleaseGroups() error {
 	}
 	if missingReleaseGroups == 0 {
 		return nil
+	}
+	config, err := s.providerConfig("musicbrainz")
+	if err != nil || !config.Enabled || config.Paused {
+		return err
 	}
 	if _, _, err := s.StartScrapeProvider("musicbrainz"); err != nil {
 		return fmt.Errorf("start MusicBrainz release-group enrichment: %w", err)

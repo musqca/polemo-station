@@ -51,45 +51,105 @@ func TestScrapeDisabledProviderStaysPending(t *testing.T) {
 	}
 }
 
-func TestScrapeQueuePrioritizesProviderStage(t *testing.T) {
+func TestScrapeQueueWaitsForTheSongsOwnMusicBrainzID(t *testing.T) {
 	service := newTransferTestService(t)
-	past := time.Now().Add(-time.Hour)
-	retry := ScrapeItem{ServerFileID: "retry", Provider: "musicbrainz", State: ScrapeRetry, FailureCount: 1, NextRetryAt: &past}
-	pending := ScrapeItem{ServerFileID: "pending", Provider: "lrclib", State: ScrapePending}
-	for _, item := range []*ScrapeItem{&retry, &pending} {
-		if err := service.db.Create(item).Error; err != nil {
+	key := "fixture-key"
+	if err := service.SaveScrapeProvider("fanarttv", true, &key); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	items := []ScrapeItem{
+		{ServerFileID: "waiting", Provider: "musicbrainz", State: ScrapePending},
+		{ServerFileID: "waiting", Provider: "coverartarchive", State: ScrapePending, CreatedAt: old},
+		{ServerFileID: "waiting", Provider: "fanarttv", State: ScrapePending, CreatedAt: old},
+		{ServerFileID: "ready", Provider: "musicbrainz", State: ScrapeSuccess, ExternalID: "release", RelatedExternalID: "group"},
+		{ServerFileID: "ready", Provider: "coverartarchive", State: ScrapePending},
+		{ServerFileID: "ready", Provider: "fanarttv", State: ScrapePending},
+	}
+	if err := service.db.Create(&items).Error; err != nil {
+		t.Fatal(err)
+	}
+	service.SetScrapeHTTPClient(&http.Client{Transport: scrapeRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/release/release":
+			return scrapeResponse(http.StatusOK, `{"images":[{"image":"https://fixture.example/archive.jpg","front":true,"approved":true}]}`), nil
+		case "/v3.2/music/albums/group":
+			return scrapeResponse(http.StatusOK, `{"albums":[{"albumcover":[{"url":"https://fixture.example/fanart.jpg"}]}]}`), nil
+		case "/archive.jpg", "/fanart.jpg":
+			return scrapeResponse(http.StatusOK, "\xff\xd8\xff\xe0"+r.URL.Path), nil
+		default:
+			return nil, fmt.Errorf("unexpected request to %s", r.URL)
+		}
+	})})
+	service.coolScrapeProvider("musicbrainz", time.Minute)
+	for _, provider := range []string{"coverartarchive", "fanarttv"} {
+		claimed, err := service.claimScrapeItem()
+		if err != nil || claimed == nil || claimed.ServerFileID != "ready" || claimed.Provider != provider {
+			t.Fatalf("wanted ready %s cover while MusicBrainz was cooling: item=%+v, err=%v", provider, claimed, err)
+		}
+		if err := service.processScrapeItem(*claimed); err != nil {
 			t.Fatal(err)
+		}
+		var saved MetadataResource
+		if err := service.db.Where("server_file_id = ? AND source = ? AND type = ?", "ready", provider, "cover").First(&saved).Error; err != nil {
+			t.Fatalf("%s cover was not saved: %v", provider, err)
 		}
 	}
 	claimed, err := service.claimScrapeItem()
-	if err != nil {
+	if err != nil || claimed != nil {
+		t.Fatalf("a cover with a pending MusicBrainz ID was claimed: item=%+v, err=%v", claimed, err)
+	}
+	if err := service.db.Model(&items[0]).Updates(map[string]any{
+		"state": ScrapeSuccess, "external_id": "second-release", "related_external_id": "second-group",
+	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if claimed == nil || claimed.ID != retry.ID {
-		t.Fatalf("musicbrainz stage did not win over a later provider: %+v", claimed)
+	service.scrapeRateMu.Lock()
+	delete(service.scrapeProviderNext, "coverartarchive")
+	delete(service.scrapeProviderNext, "fanarttv")
+	service.scrapeRateMu.Unlock()
+	for _, provider := range []string{"coverartarchive", "fanarttv"} {
+		claimed, err := service.claimScrapeItem()
+		if err != nil || claimed == nil || claimed.ServerFileID != "waiting" || claimed.Provider != provider {
+			t.Fatalf("wanted %s cover after its ID became available: item=%+v, err=%v", provider, claimed, err)
+		}
 	}
 }
 
-func TestScrapeQueueWaitsForCooledEarlierStage(t *testing.T) {
-	service := newTransferTestService(t)
-	old := time.Now().Add(-time.Hour)
-	for index := 0; index < 256; index++ {
-		item := ScrapeItem{ServerFileID: fmt.Sprintf("cooled-%d", index), Provider: "musicbrainz", State: ScrapePending, CreatedAt: old}
-		if err := service.db.Create(&item).Error; err != nil {
-			t.Fatal(err)
-		}
-	}
-	healthy := ScrapeItem{ServerFileID: "healthy", Provider: "lrclib", State: ScrapePending}
-	if err := service.db.Create(&healthy).Error; err != nil {
-		t.Fatal(err)
-	}
-	service.coolScrapeProvider("musicbrainz", time.Minute)
-	claimed, err := service.claimScrapeItem()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if claimed != nil {
-		t.Fatalf("later provider ran while earlier stage cooled: %+v", claimed)
+func TestTitleScrapersRunWhileMusicBrainzStillHasWork(t *testing.T) {
+	for _, cooling := range []bool{false, true} {
+		t.Run(fmt.Sprintf("musicbrainz cooling=%t", cooling), func(t *testing.T) {
+			service := newTransferTestService(t)
+			files := []ScrapeItem{
+				{ServerFileID: "first-mb", Provider: "musicbrainz", State: ScrapePending},
+				{ServerFileID: "second-mb", Provider: "musicbrainz", State: ScrapePending},
+				{ServerFileID: "second-mb", Provider: "coverartarchive", State: ScrapePending},
+				{ServerFileID: "title-lyrics", Provider: "lrclib", State: ScrapePending},
+				{ServerFileID: "title-cover", Provider: "theaudiodb", State: ScrapePending},
+			}
+			if err := service.db.Create(&files).Error; err != nil {
+				t.Fatal(err)
+			}
+			order := []string{"musicbrainz", "lrclib", "theaudiodb"}
+			if cooling {
+				service.coolScrapeProvider("musicbrainz", time.Minute)
+				order = order[1:]
+			}
+			for _, provider := range order {
+				item, err := service.claimScrapeItem()
+				if err != nil || item == nil || item.Provider != provider {
+					t.Fatalf("wanted %s while MusicBrainz still had tasks: item=%+v, err=%v", provider, item, err)
+				}
+				if err := service.finishScrapeSuccess(item); err != nil {
+					t.Fatal(err)
+				}
+				if provider == "musicbrainz" {
+					service.scrapeRateMu.Lock()
+					service.scrapeProviderNext[provider] = time.Now()
+					service.scrapeRateMu.Unlock()
+				}
+			}
+		})
 	}
 }
 
@@ -357,9 +417,9 @@ func TestScrapeRequestTimeoutAndFailureIsolation(t *testing.T) {
 	}
 }
 
-func TestScrapeMissingArtistEndsNoMatchWithoutRequestFailure(t *testing.T) {
+func TestScrapeMissingTitleEndsNoMatchWithoutRequestFailure(t *testing.T) {
 	service := newTransferTestService(t)
-	file := ServerFile{ServerFileID: "missing-artist", Title: "Song"}
+	file := ServerFile{ServerFileID: "missing-title", Artist: "Artist"}
 	if err := service.db.Create(&file).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -374,13 +434,13 @@ func TestScrapeMissingArtistEndsNoMatchWithoutRequestFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	if item.State != ScrapeNoMatch || item.FailureCount != 0 || !strings.Contains(item.LastError, "requires track title and artist") {
-		t.Fatalf("missing artist was retried as request failure: %+v", item)
+		t.Fatalf("missing title was retried as request failure: %+v", item)
 	}
 }
 
 func TestScrapeLyricsUsesMusicBrainzCandidateWithoutChangingFileMetadata(t *testing.T) {
 	service := newTransferTestService(t)
-	file := ServerFile{ServerFileID: "lyrics-musicbrainz-candidate", Title: "Song"}
+	file := ServerFile{ServerFileID: "lyrics-musicbrainz-candidate"}
 	if err := service.db.Create(&file).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +463,7 @@ func TestScrapeLyricsUsesMusicBrainzCandidateWithoutChangingFileMetadata(t *test
 	if err := service.db.First(&file, "server_file_id = ?", file.ServerFileID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if file.Artist != "" {
+	if file.Title != "" || file.Artist != "" {
 		t.Fatalf("scrape changed selected file metadata: %+v", file)
 	}
 }
