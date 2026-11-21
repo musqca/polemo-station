@@ -417,6 +417,9 @@ func (s *Service) Migrate() error {
 	if err := s.migrateMetadataCursor(); err != nil {
 		return err
 	}
+	if err := s.migrateTracksToServerFiles(); err != nil {
+		return err
+	}
 	if _, err := s.stationIdentity(); err != nil {
 		return err
 	}
@@ -517,9 +520,92 @@ func (s *Service) upsertTracks(deviceID, snapshotID string, tracks []Track) erro
 			} else {
 				return err
 			}
+			if tracks[i].ServerFileID != "" {
+				var sf ServerFile
+				if lookupErr := tx.Where("server_file_id = ?", tracks[i].ServerFileID).First(&sf).Error; errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+					fileName := filepath.Base(tracks[i].RelativePath)
+					if fileName == "" || fileName == "." {
+						fileName = tracks[i].Title
+						if fileName == "" {
+							fileName = tracks[i].ServerFileID
+						}
+					}
+					placeholder := ServerFile{
+						ServerFileID:   tracks[i].ServerFileID,
+						SourceDeviceID: deviceID,
+						StoragePath:    "",
+						FileName:       fileName,
+						RelativePath:   tracks[i].RelativePath,
+						Title:          tracks[i].Title,
+						Artist:         tracks[i].Artist,
+						Album:          tracks[i].Album,
+						AlbumArtist:    tracks[i].AlbumArtist,
+						Format:         tracks[i].Format,
+						Size:           tracks[i].Size,
+						Hash:           tracks[i].Hash,
+						TrackNumber:    tracks[i].TrackNumber,
+						DiscNumber:     tracks[i].DiscNumber,
+						CreatedAt:      time.Now(),
+						UpdatedAt:      time.Now(),
+					}
+					if createErr := tx.Create(&placeholder).Error; createErr != nil {
+						return createErr
+					}
+				}
+			}
 		}
 		return nil
 	})
+}
+
+func (s *Service) migrateTracksToServerFiles() error {
+	var tracks []Track
+	if err := s.db.Where("server_file_id <> '' AND server_file_id IS NOT NULL").
+		Order("last_seen_at desc").Find(&tracks).Error; err != nil {
+		return err
+	}
+	seen := make(map[string]bool)
+	for _, track := range tracks {
+		if seen[track.ServerFileID] {
+			continue
+		}
+		seen[track.ServerFileID] = true
+		var existing ServerFile
+		err := s.db.Where("server_file_id = ?", track.ServerFileID).First(&existing).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			fileName := filepath.Base(track.RelativePath)
+			if fileName == "" || fileName == "." {
+				fileName = track.Title
+				if fileName == "" {
+					fileName = track.ServerFileID
+				}
+			}
+			file := ServerFile{
+				ServerFileID:   track.ServerFileID,
+				SourceDeviceID: track.DeviceID,
+				StoragePath:    "",
+				FileName:       fileName,
+				RelativePath:   track.RelativePath,
+				Title:          track.Title,
+				Artist:         track.Artist,
+				Album:          track.Album,
+				AlbumArtist:    track.AlbumArtist,
+				Format:         track.Format,
+				Size:           track.Size,
+				Hash:           track.Hash,
+				TrackNumber:    track.TrackNumber,
+				DiscNumber:     track.DiscNumber,
+				CreatedAt:      time.Now(),
+				UpdatedAt:      time.Now(),
+			}
+			if err := s.db.Create(&file).Error; err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Service) ListDevices() ([]Device, error) {

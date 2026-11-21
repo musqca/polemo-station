@@ -78,3 +78,38 @@ func TestUpsertTracksUsesServerFileIDForRemoteTracks(t *testing.T) {
 		t.Fatalf("got %d rows for sf-a, want one", count)
 	}
 }
+
+func TestUpsertTracksCreatesServerFilePlaceholdersAndListsThem(t *testing.T) {
+	service := newTransferTestService(t)
+	tracks := []Track{
+		{
+			FileID:       "file-1",
+			RelativePath: "Rock/Song1.flac",
+			FileName:     "Song1.flac",
+			Title:        "Track One",
+			Artist:       "Artist A",
+			Album:        "Album A",
+			ServerFileID: "sf-song-1",
+			Size:         2048,
+			Hash:         "hash-1",
+			Format:       "FLAC",
+		},
+	}
+	if err := service.upsertTracks("device-x", "snap-1", tracks); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := service.ListServerFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file in ListServerFiles, got %d", len(files))
+	}
+	if files[0].ServerFileID != "sf-song-1" || files[0].Title != "Track One" || files[0].Artist != "Artist A" {
+		t.Fatalf("unexpected file content: %+v", files[0])
+	}
+	if files[0].ExistsOnServer || files[0].HasAudio {
+		t.Fatalf("placeholder should have ExistsOnServer=false and HasAudio=false, got %v / %v", files[0].ExistsOnServer, files[0].HasAudio)
+	}
+}

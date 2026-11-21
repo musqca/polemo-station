@@ -100,6 +100,21 @@ func TestFrontendUnknownAssetIsNotFound(t *testing.T) {
 	}
 }
 
+func TestFrontendAuthorizationProvidersRoute(t *testing.T) {
+	if _, err := fs.Stat(frontend.Assets, "build/zh-CN/authorization/providers.html"); err != nil {
+		t.Skip("full frontend build is not embedded; run make pkg")
+	}
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	Frontend(engine)
+	request := httptest.NewRequest("GET", "/zh-CN/authorization/providers", nil)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, request)
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), "<!doctype html>") {
+		t.Fatalf("authorization providers response = %d %q", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestFrontendLeavesAPIForGin(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()

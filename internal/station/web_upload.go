@@ -53,10 +53,10 @@ func (s *Service) ImportWebUpload(fileName string, source io.Reader) (ServerFile
 
 	var existing ServerFile
 	err = s.db.Where("server_file_id = ?", serverFileID).First(&existing).Error
-	if err == nil {
+	if err == nil && existing.StoragePath != "" {
 		return s.serverFileView(existing)
 	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return ServerFileView{}, err
 	}
 
@@ -74,9 +74,29 @@ func (s *Service) ImportWebUpload(fileName string, source io.Reader) (ServerFile
 		SourceDeviceID: "web", FileName: name, Size: size, Hash: hash, Version: 1,
 		Title: strings.TrimSuffix(name, filepath.Ext(name)), Format: strings.TrimPrefix(strings.ToUpper(extension), "."),
 	}
-	if err := s.db.Create(&file).Error; err != nil {
-		_ = os.Remove(objectPath)
-		return ServerFileView{}, err
+	if err == nil && existing.StoragePath == "" {
+		file.ID = existing.ID
+		if existing.Title != "" {
+			file.Title = existing.Title
+		}
+		if existing.Artist != "" {
+			file.Artist = existing.Artist
+		}
+		if existing.Album != "" {
+			file.Album = existing.Album
+		}
+		if existing.AlbumArtist != "" {
+			file.AlbumArtist = existing.AlbumArtist
+		}
+		if err := s.db.Save(&file).Error; err != nil {
+			_ = os.Remove(objectPath)
+			return ServerFileView{}, err
+		}
+	} else {
+		if err := s.db.Create(&file).Error; err != nil {
+			_ = os.Remove(objectPath)
+			return ServerFileView{}, err
+		}
 	}
 	s.importLocalEmbeddedMetadata(objectPath, serverFileID)
 	s.emitLibraryChanged("web")

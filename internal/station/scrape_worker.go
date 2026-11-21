@@ -157,7 +157,7 @@ func (s *Service) claimScrapeItem() (*ScrapeItem, error) {
 			if err := tx.Where("provider = ?", provider).
 				Where("(state = ? OR state = ?) AND (next_retry_at IS NULL OR next_retry_at <= ?) AND failure_count < ?", ScrapePending, ScrapeRetry, now, settings.MaxFailures).
 				Where("(lease_until IS NULL OR lease_until < ?)", now).
-				Order("failure_count asc, created_at asc").Offset(offset).Limit(candidateBatchSize).Find(&candidates).Error; err != nil {
+				Order("created_at asc").Offset(offset).Limit(candidateBatchSize).Find(&candidates).Error; err != nil {
 				return err
 			}
 			if len(candidates) == 0 {
@@ -190,7 +190,7 @@ func (s *Service) scrapeProviderReady(provider string, now time.Time) bool {
 	return !now.Before(s.scrapeProviderNext[provider])
 }
 func (s *Service) noteScrapeRequest(provider string, now time.Time) {
-	interval := time.Second
+	interval := 1500 * time.Millisecond
 	if provider == "lrclib" {
 		interval = 100 * time.Millisecond
 	}
@@ -675,12 +675,12 @@ func (s *Service) finishScrapeSuccess(item *ScrapeItem) error {
 	return s.db.Model(&ScrapeItem{}).Where("id = ?", item.ID).Updates(map[string]any{
 		"state": ScrapeSuccess, "finished_at": now, "lease_until": nil,
 		"external_id": item.ExternalID, "related_external_id": item.RelatedExternalID, "added_count": item.AddedCount,
-		"dependency_wait_count": 0, "last_error": "", "last_error_code": "",
+		"dependency_wait_count": 0, "failure_count": 0, "next_retry_at": nil, "last_error": "", "last_error_code": "",
 	}).Error
 }
 func (s *Service) finishScrapeNoMatch(item *ScrapeItem, err error) error {
 	now := time.Now()
-	return s.db.Model(&ScrapeItem{}).Where("id = ?", item.ID).Updates(map[string]any{"state": ScrapeNoMatch, "finished_at": now, "lease_until": nil, "failure_count": 0, "last_error": err.Error(), "last_error_code": "no_match", "added_count": item.AddedCount}).Error
+	return s.db.Model(&ScrapeItem{}).Where("id = ?", item.ID).Updates(map[string]any{"state": ScrapeNoMatch, "finished_at": now, "lease_until": nil, "failure_count": 0, "next_retry_at": nil, "last_error": err.Error(), "last_error_code": "no_match", "added_count": item.AddedCount}).Error
 }
 func (s *Service) finishScrapeFailure(item *ScrapeItem, err error) error {
 	if s.scrapeProviderPaused(item.Provider) {

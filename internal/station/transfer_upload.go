@@ -384,7 +384,23 @@ func (s *Service) finalizeUpload(task *TransferTask) (ServerFile, error) {
 				return err
 			}
 		} else if lookup == nil {
-			return errors.New("server file already exists with different content")
+			if current.StoragePath == "" {
+				serverFile.ID = current.ID
+				if serverFile.Title == "" {
+					serverFile.Title = current.Title
+				}
+				if serverFile.Artist == "" {
+					serverFile.Artist = current.Artist
+				}
+				if serverFile.Album == "" {
+					serverFile.Album = current.Album
+				}
+				if err := tx.Save(&serverFile).Error; err != nil {
+					return err
+				}
+			} else {
+				return errors.New("server file already exists with different content")
+			}
 		} else {
 			return lookup
 		}

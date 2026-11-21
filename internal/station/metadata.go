@@ -37,6 +37,8 @@ type MetadataResourceView struct {
 
 type ServerFileView struct {
 	ServerFile
+	ExistsOnServer  bool                   `json:"existsOnServer"`
+	HasAudio        bool                   `json:"hasAudio"`
 	HasCover        bool                   `json:"hasCover"`
 	CoverURL        string                 `json:"coverUrl,omitempty"`
 	Resources       []MetadataResourceView `json:"resources"`
@@ -123,7 +125,29 @@ func (s *Service) serverFileView(file ServerFile) (ServerFileView, error) {
 	}
 	view.MissingMetadata = strings.TrimSpace(file.Title) == "" || strings.TrimSpace(file.Artist) == "" ||
 		strings.TrimSpace(file.Album) == ""
+	hasAudio := s.HasAudioFile(file)
+	view.HasAudio = hasAudio
+	view.ExistsOnServer = hasAudio
 	return view, nil
+}
+
+func (s *Service) HasAudioFile(file ServerFile) bool {
+	if file.StoragePath != "" {
+		if _, err := os.Stat(file.StoragePath); err == nil {
+			return true
+		}
+	}
+	var locations []MediaLocation
+	if err := s.db.Where("server_file_id = ? AND available = ?", file.ServerFileID, true).Find(&locations).Error; err == nil {
+		for _, location := range locations {
+			if location.LocalPath != "" {
+				if info, statErr := os.Stat(location.LocalPath); statErr == nil && info.Size() == location.Size {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func isScrapedMetadataSource(source string) bool {

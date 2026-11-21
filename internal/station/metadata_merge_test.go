@@ -104,4 +104,16 @@ func TestMergeDeviceResourcesBatchEndToEnd(t *testing.T) {
 	if err != nil || acceptedThird != 1 {
 		t.Fatalf("expected the different lyrics to be stored, got %d accepted: %v", acceptedThird, err)
 	}
+
+	// Verify placeholder ServerFile was created without physical audio
+	view, err := service.GetServerFile(serverFileID)
+	if err != nil {
+		t.Fatalf("expected placeholder ServerFile to exist, got %v", err)
+	}
+	if view.Title != "Song Title" || view.Artist != "Singer" {
+		t.Fatalf("unexpected metadata in placeholder: title=%q, artist=%q", view.Title, view.Artist)
+	}
+	if view.ExistsOnServer || view.HasAudio {
+		t.Fatalf("expected ExistsOnServer and HasAudio to be false for placeholder, got exists=%v audio=%v", view.ExistsOnServer, view.HasAudio)
+	}
 }

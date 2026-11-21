@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -57,6 +58,7 @@ func (s *Service) MergeDeviceResourceBatch(a *ws.Context) {
 		}
 	}
 	accepted := 0
+	serverFileIDs := make([]string, 0, len(request.Items))
 	for _, item := range request.Items {
 		count, err := s.mergeDeviceResources(deviceID, item)
 		if err != nil {
@@ -64,6 +66,10 @@ func (s *Service) MergeDeviceResourceBatch(a *ws.Context) {
 			return
 		}
 		accepted += count
+		serverFileIDs = append(serverFileIDs, item.ServerFileID)
+	}
+	if len(serverFileIDs) > 0 {
+		_, _ = s.EnqueueScrape(serverFileIDs)
 	}
 	a.Send(map[string]any{
 		"accepted":  accepted,
@@ -72,6 +78,7 @@ func (s *Service) MergeDeviceResourceBatch(a *ws.Context) {
 }
 
 func (s *Service) mergeDeviceResources(deviceID string, request ResourceMergeRequest) (int, error) {
+	s.ensurePlaceholderServerFile(request.ServerFileID, deviceID, request.Resources)
 	accepted := 0
 	for _, input := range request.Resources {
 		resource, binary, err := mergedResource(request.ServerFileID, deviceID, input)
@@ -164,4 +171,66 @@ func mergedResource(serverFileID, deviceID string, input ResourceMergeInput) (Me
 		MIME: mimeType, Source: "device:" + safePathSegment(deviceID), Format: format,
 		Language: language, CreatedAt: time.Now(),
 	}, binary, nil
+}
+
+func (s *Service) ensurePlaceholderServerFile(serverFileID, deviceID string, resources []ResourceMergeInput) {
+	var current ServerFile
+	err := s.db.Where("server_file_id = ?", serverFileID).First(&current).Error
+	if err == nil {
+		return
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return
+	}
+	file := ServerFile{
+		ServerFileID:   serverFileID,
+		SourceDeviceID: deviceID,
+		StoragePath:    "",
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	var track Track
+	if err := s.db.Where("server_file_id = ?", serverFileID).Order("last_seen_at desc").First(&track).Error; err == nil {
+		file.Title = track.Title
+		file.Artist = track.Artist
+		file.Album = track.Album
+		file.AlbumArtist = track.AlbumArtist
+		file.FileName = filepath.Base(track.RelativePath)
+		file.RelativePath = track.RelativePath
+		file.Size = track.Size
+		file.Hash = track.Hash
+		file.Format = track.Format
+	}
+	for _, res := range resources {
+		if strings.ToLower(res.Type) == "metadata" && res.Data != "" {
+			var snap metadataSnapshot
+			if jsonErr := json.Unmarshal([]byte(res.Data), &snap); jsonErr == nil {
+				if snap.Title != "" {
+					file.Title = snap.Title
+				}
+				if snap.Artist != "" {
+					file.Artist = snap.Artist
+				}
+				if snap.Album != "" {
+					file.Album = snap.Album
+				}
+				if snap.AlbumArtist != "" {
+					file.AlbumArtist = snap.AlbumArtist
+				}
+				if snap.Track != 0 {
+					file.TrackNumber = snap.Track
+				}
+				if snap.Disc != 0 {
+					file.DiscNumber = snap.Disc
+				}
+			}
+		}
+	}
+	if file.FileName == "" {
+		file.FileName = file.Title
+		if file.FileName == "" {
+			file.FileName = serverFileID
+		}
+	}
+	_ = s.db.Create(&file).Error
 }

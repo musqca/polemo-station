@@ -32,7 +32,7 @@ func WithUserAgent(value string) Option        { return func(c *Client) { c.user
 func WithTimeout(value time.Duration) Option   { return func(c *Client) { c.timeout = value } }
 
 func NewClient(opts ...Option) *Client {
-	c := &Client{baseURL: defaultBaseURL, userAgent: "Polemo Station/1.0 (metadata)", timeout: 15 * time.Second}
+	c := &Client{baseURL: defaultBaseURL, userAgent: "Polemo Station/1.0 ( https://github.com/musqca/polemo-station )", timeout: 15 * time.Second}
 	for _, opt := range opts {
 		opt(c)
 	}
