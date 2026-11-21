@@ -119,7 +119,8 @@ var api = &cobra.Command{
 			)
 		}
 
-		g := gin.Default()
+		g := gin.New()
+		g.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{station.DiscogsOAuthCallbackPath}}), gin.Recovery())
 
 		router.Api(g, syncService)
 		router.Actions(app, syncService)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/musqca/polemo-station/internal/thirdparty/coverartarchive"
+	"github.com/musqca/polemo-station/internal/thirdparty/discogs"
 	"github.com/musqca/polemo-station/internal/thirdparty/fanarttv"
 	"github.com/musqca/polemo-station/internal/thirdparty/lrclib"
 	"github.com/musqca/polemo-station/internal/thirdparty/musicbrainz"
@@ -20,7 +21,7 @@ import (
 	"gorm.io/gorm"
 )
 
-var scrapeProviders = []string{"musicbrainz", "coverartarchive", "fanarttv", "lrclib", "theaudiodb"}
+var scrapeProviders = []string{discogsProvider, "musicbrainz", "coverartarchive", "fanarttv", "lrclib", "theaudiodb"}
 var errScrapeDependency = errors.New("scrape dependency is not ready")
 var errScrapeProviderDisabled = errors.New("scrape provider is disabled")
 
@@ -42,7 +43,7 @@ func (s *Service) initializeScrapeSettings() error {
 	for _, provider := range scrapeProviders {
 		var config ThirdPartyProviderConfig
 		if err := s.db.Where("provider = ?", provider).First(&config).Error; errors.Is(err, gorm.ErrRecordNotFound) {
-			if err := s.db.Create(&ThirdPartyProviderConfig{Provider: provider, Enabled: provider != "fanarttv", UpdatedAt: time.Now()}).Error; err != nil {
+			if err := s.db.Create(&ThirdPartyProviderConfig{Provider: provider, Enabled: !scrapeProviderRequiresAPIKey(provider), UpdatedAt: time.Now()}).Error; err != nil {
 				return err
 			}
 		} else if err != nil {
@@ -134,9 +135,9 @@ func (s *Service) claimScrapeItem() (*ScrapeItem, error) {
 		for _, config := range configs {
 			enabled[config.Provider] = !config.Paused
 		}
-		provider := ""
+		stagedProvider := ""
 		for _, candidate := range scrapeProviders {
-			if !enabled[candidate] {
+			if candidate == discogsProvider || !enabled[candidate] {
 				continue
 			}
 			var activeCount int64
@@ -144,37 +145,33 @@ func (s *Service) claimScrapeItem() (*ScrapeItem, error) {
 				return err
 			}
 			if activeCount > 0 {
-				provider = candidate
+				stagedProvider = candidate
 				break
 			}
 		}
-		if provider == "" {
-			return gorm.ErrRecordNotFound
+		// Discogs can take a turn whenever the ordered stages have no ready work.
+		// When both are ready, alternate so neither side can starve the other.
+		order := [2]string{discogsProvider, stagedProvider}
+		s.scrapeRateMu.Lock()
+		if s.lastScrapeProvider == discogsProvider {
+			order[0], order[1] = order[1], order[0]
 		}
-		const candidateBatchSize = 256
-		for offset := 0; ; offset += candidateBatchSize {
-			var candidates []ScrapeItem
-			if err := tx.Where("provider = ?", provider).
-				Where("(state = ? OR state = ?) AND (next_retry_at IS NULL OR next_retry_at <= ?) AND failure_count < ?", ScrapePending, ScrapeRetry, now, settings.MaxFailures).
+		s.scrapeRateMu.Unlock()
+		for _, provider := range order {
+			if !enabled[provider] || !s.scrapeProviderReady(provider, now) {
+				continue
+			}
+			err := tx.Where("provider = ?", provider).
+				Where("state IN ? AND (next_retry_at IS NULL OR next_retry_at <= ?) AND failure_count < ?", []string{ScrapePending, ScrapeRetry}, now, settings.MaxFailures).
 				Where("(lease_until IS NULL OR lease_until < ?)", now).
-				Order("created_at asc").Offset(offset).Limit(candidateBatchSize).Find(&candidates).Error; err != nil {
+				Order("created_at asc").First(&item).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				continue
+			}
+			if err != nil {
 				return err
 			}
-			if len(candidates) == 0 {
-				break
-			}
-			for _, candidate := range candidates {
-				if !s.scrapeProviderReady(candidate.Provider, now) {
-					continue
-				}
-				item = candidate
-				lease := now.Add(2 * time.Minute)
-				if err := tx.Model(&item).Updates(map[string]any{"state": ScrapeRunning, "started_at": now, "lease_until": lease, "last_error": ""}).Error; err != nil {
-					return err
-				}
-				s.noteScrapeRequest(item.Provider, now)
-				return nil
-			}
+			return s.startClaimedScrapeItem(tx, &item, now)
 		}
 		return gorm.ErrRecordNotFound
 	})
@@ -182,6 +179,15 @@ func (s *Service) claimScrapeItem() (*ScrapeItem, error) {
 		return nil, nil
 	}
 	return &item, err
+}
+
+func (s *Service) startClaimedScrapeItem(tx *gorm.DB, item *ScrapeItem, now time.Time) error {
+	lease := now.Add(2 * time.Minute)
+	if err := tx.Model(item).Updates(map[string]any{"state": ScrapeRunning, "started_at": now, "lease_until": lease, "last_error": ""}).Error; err != nil {
+		return err
+	}
+	s.noteScrapeRequest(item.Provider, now)
+	return nil
 }
 
 func (s *Service) scrapeProviderReady(provider string, now time.Time) bool {
@@ -199,6 +205,7 @@ func (s *Service) noteScrapeRequest(provider string, now time.Time) {
 	}
 	s.scrapeRateMu.Lock()
 	s.scrapeProviderNext[provider] = now.Add(interval)
+	s.lastScrapeProvider = provider
 	s.scrapeRateMu.Unlock()
 }
 func (s *Service) coolScrapeProvider(provider string, delay time.Duration) {
@@ -220,6 +227,8 @@ func (s *Service) processScrapeItem(item ScrapeItem) error {
 	defer cancel()
 	var processErr error
 	switch item.Provider {
+	case discogsProvider:
+		processErr = s.scrapeDiscogs(ctx, &item, settings)
 	case "musicbrainz":
 		processErr = s.scrapeMusicBrainz(ctx, &item, settings)
 	case "coverartarchive":
@@ -236,7 +245,7 @@ func (s *Service) processScrapeItem(item ScrapeItem) error {
 	if processErr == nil {
 		return s.finishScrapeSuccess(&item)
 	}
-	if errors.Is(processErr, musicbrainz.ErrNoMatch) || errors.Is(processErr, coverartarchive.ErrNoCover) || errors.Is(processErr, fanarttv.ErrNoCover) || errors.Is(processErr, lrclib.ErrNoMatch) || errors.Is(processErr, lrclib.ErrInvalidQuery) || errors.Is(processErr, theaudiodb.ErrNoMatch) {
+	if errors.Is(processErr, discogs.ErrNoMatch) || errors.Is(processErr, musicbrainz.ErrNoMatch) || errors.Is(processErr, coverartarchive.ErrNoCover) || errors.Is(processErr, fanarttv.ErrNoCover) || errors.Is(processErr, lrclib.ErrNoMatch) || errors.Is(processErr, lrclib.ErrInvalidQuery) || errors.Is(processErr, theaudiodb.ErrNoMatch) {
 		return s.finishScrapeNoMatch(&item, processErr)
 	}
 	if errors.Is(processErr, errScrapeDependency) {
@@ -721,6 +730,9 @@ func (s *Service) pauseScrapeItem(item *ScrapeItem) error {
 // for Cover Art Archive's archive.org download nodes and does not indicate that
 // the provider is rejecting our request.
 func scrapeRetryDelay(err error, settings ScrapeSettings) time.Duration {
+	if delay := discogsRetryDelay(err); delay > 0 {
+		return delay
+	}
 	message := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(message, "http 429"):

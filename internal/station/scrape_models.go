@@ -19,6 +19,16 @@ type ThirdPartyProviderConfig struct {
 	Paused    bool      `json:"paused"`
 	APIKey    string    `gorm:"size:512" json:"-"`
 	UpdatedAt time.Time `json:"updatedAt"`
+
+	OAuthConsumerKey       string `gorm:"column:oauth_consumer_key;size:512" json:"-"`
+	OAuthConsumerSecret    string `gorm:"column:oauth_consumer_secret;size:512" json:"-"`
+	OAuthAccessToken       string `gorm:"column:oauth_access_token;size:512" json:"-"`
+	OAuthAccessTokenSecret string `gorm:"column:oauth_access_token_secret;size:512" json:"-"`
+}
+
+func (c ThirdPartyProviderConfig) discogsOAuthConnected() bool {
+	return c.Provider == discogsProvider && c.OAuthConsumerKey != "" && c.OAuthConsumerSecret != "" &&
+		c.OAuthAccessToken != "" && c.OAuthAccessTokenSecret != ""
 }
 
 type ScrapeItem struct {
@@ -41,6 +51,8 @@ type ScrapeItem struct {
 	AddedCount          int        `json:"addedCount"`
 	CreatedAt           time.Time  `json:"createdAt"`
 	UpdatedAt           time.Time  `json:"updatedAt"`
+
+	DiscogsMatch *discogsPreview `gorm:"-" json:"discogsMatch,omitempty"`
 }
 
 // ScrapeRun preserves the scope of one user-initiated provider scan. Items
@@ -82,6 +94,7 @@ type ScrapeProviderView struct {
 	Paused         bool   `json:"paused"`
 	Configured     bool   `json:"configured"`
 	RequiresAPIKey bool   `json:"requiresApiKey"`
+	OAuthConnected bool   `json:"oauthConnected,omitempty"`
 	RunID          string `json:"runId,omitempty"`
 	RunTotal       int    `json:"runTotal,omitempty"`
 	SkippedSuccess int    `json:"skippedSuccess,omitempty"`

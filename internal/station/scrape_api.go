@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"github.com/musqca/polemo-station/internal/thirdparty/coverartarchive"
 	"github.com/musqca/polemo-station/internal/thirdparty/fanarttv"
@@ -27,7 +28,9 @@ func (s *Service) ScrapeSettingsView() (ScrapeSettingsView, error) {
 	}
 	providers := make([]ScrapeProviderView, 0, len(configs))
 	for _, config := range configs {
-		view := ScrapeProviderView{Provider: config.Provider, Enabled: config.Enabled, Paused: config.Paused, Configured: strings.TrimSpace(config.APIKey) != "", RequiresAPIKey: scrapeProviderRequiresAPIKey(config.Provider)}
+		oauthConnected := config.discogsOAuthConnected()
+		view := ScrapeProviderView{Provider: config.Provider, Enabled: config.Enabled, Paused: config.Paused,
+			Configured: oauthConnected || strings.TrimSpace(config.APIKey) != "", RequiresAPIKey: scrapeProviderRequiresAPIKey(config.Provider), OAuthConnected: oauthConnected}
 		var latest ScrapeRun
 		if err := s.db.Where("provider = ?", config.Provider).Order("created_at desc").First(&latest).Error; err == nil {
 			view.RunID, view.RunTotal, view.SkippedSuccess = latest.RunID, latest.Total, latest.SkippedSuccess
@@ -97,6 +100,10 @@ func (s *Service) SaveScrapeProvider(provider string, enabled bool, apiKey *stri
 	if !isScrapeProvider(provider) {
 		return errors.New("unknown scrape provider")
 	}
+	if provider == discogsProvider {
+		s.discogsOAuth.Lock()
+		defer s.discogsOAuth.Unlock()
+	}
 	var config ThirdPartyProviderConfig
 	err := s.db.Where("provider = ?", provider).First(&config).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -108,11 +115,23 @@ func (s *Service) SaveScrapeProvider(provider string, enabled bool, apiKey *stri
 	if apiKey != nil {
 		config.APIKey = strings.TrimSpace(*apiKey)
 	}
-	if config.Enabled && scrapeProviderRequiresAPIKey(provider) && strings.TrimSpace(config.APIKey) == "" {
+	if config.Enabled && scrapeProviderRequiresAPIKey(provider) && strings.TrimSpace(config.APIKey) == "" && !config.discogsOAuthConnected() {
+		if provider == discogsProvider {
+			return errors.New("connect a Discogs account or configure a personal access token before enabling Discogs")
+		}
 		return errors.New("fanart.tv API key is required before enabling this provider")
 	}
 	config.UpdatedAt = time.Now()
-	return s.db.Save(&config).Error
+	// The configured SQL logger may expand bound values on slow queries and errors.
+	db := s.db.Session(&gorm.Session{Logger: logger.Discard})
+	if config.ID == 0 {
+		return db.Create(&config).Error
+	}
+	updates := map[string]any{"enabled": config.Enabled, "updated_at": config.UpdatedAt}
+	if apiKey != nil {
+		updates["api_key"] = config.APIKey
+	}
+	return db.Model(&config).Updates(updates).Error
 }
 
 func (s *Service) SaveScrapeSettings(value ScrapeSettings) error {
@@ -142,7 +161,7 @@ func isScrapeProvider(value string) bool {
 }
 
 func scrapeProviderRequiresAPIKey(value string) bool {
-	return value == "fanarttv"
+	return value == "fanarttv" || value == discogsProvider
 }
 
 func (s *Service) TestScrapeProvider(provider string) error {
@@ -158,6 +177,15 @@ func (s *Service) TestScrapeProvider(provider string) error {
 	timeout := time.Duration(settings.RequestTimeoutSeconds) * time.Second
 	httpClient, baseURL := s.scrapeProviderHTTP(provider)
 	switch provider {
+	case discogsProvider:
+		config, err := s.providerConfig(provider)
+		if err != nil {
+			return err
+		}
+		if !config.Enabled {
+			return errScrapeProviderDisabled
+		}
+		return s.handleDiscogsError(s.newDiscogsClient(config, timeout).Check(ctx))
 	case "musicbrainz":
 		options := []musicbrainz.Option{musicbrainz.WithTimeout(timeout)}
 		if httpClient != nil {
@@ -271,6 +299,12 @@ func (s *Service) enqueueScrapeProvider(file ServerFile, config ThirdPartyProvid
 	if config.Provider == "lrclib" {
 		return s.queueLyricsScrapeIfReady(file, settings)
 	}
+	if config.Provider == discogsProvider {
+		query := discogsQuery(file)
+		if query.Title == "" || (query.Artist == "" && query.Album == "") {
+			return false, nil
+		}
+	}
 	if config.Provider == "theaudiodb" {
 		_, artist, album, err := s.lyricsQuery(file)
 		if err != nil {
@@ -369,7 +403,9 @@ func (s *Service) StartScrapeProvider(provider string) (string, int, error) {
 		if err != nil {
 			return "", count, err
 		}
-		if item.State == ScrapeSuccess && !(provider == "musicbrainz" && item.ExternalID != "" && item.RelatedExternalID == "") {
+		needsReleaseGroup := provider == "musicbrainz" && item.ExternalID != "" && item.RelatedExternalID == ""
+		needsDiscogsPreview := provider == discogsProvider && s.discogsMatch(file.ServerFileID) == nil
+		if item.State == ScrapeSuccess && !needsReleaseGroup && !needsDiscogsPreview {
 			skippedSuccess++
 			continue
 		}
@@ -452,8 +488,15 @@ func (s *Service) StopScrapeProvider(provider string) (int64, error) {
 
 func (s *Service) ListScrapeItems() ([]ScrapeItem, error) {
 	var items []ScrapeItem
-	err := s.db.Order("state asc, updated_at desc").Find(&items).Error
-	return items, err
+	if err := s.db.Order("state asc, updated_at desc").Find(&items).Error; err != nil {
+		return nil, err
+	}
+	for i := range items {
+		if items[i].Provider == discogsProvider && items[i].State == ScrapeSuccess {
+			items[i].DiscogsMatch = s.discogsMatch(items[i].ServerFileID)
+		}
+	}
+	return items, nil
 }
 
 func (s *Service) RetryScrapeItem(id uint) error {

@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/wonli/aqi/ws"
 	"github.com/musqca/polemo-station/internal/middlewares"
 	"github.com/musqca/polemo-station/internal/station"
+	"github.com/wonli/aqi/ws"
 	"gorm.io/gorm"
 )
 
@@ -95,6 +95,7 @@ func Api(g *gin.Engine, syncService *station.Service) {
 		}
 		c.Next()
 	})
+	registerDiscogsOAuth(g, stationAPI, syncService)
 	stationAPI.GET("/scrape/settings", func(c *gin.Context) {
 		if !syncService.SuperadminAuthorized(c.Request) {
 			c.AbortWithStatus(http.StatusForbidden)
@@ -187,6 +188,7 @@ func Api(g *gin.Engine, syncService *station.Service) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scrape_items_unavailable"})
 			return
 		}
+		c.Header("Cache-Control", "no-store")
 		c.JSON(http.StatusOK, gin.H{"items": items})
 	})
 	stationAPI.GET("/scrape/stats", func(c *gin.Context) {

@@ -9,8 +9,10 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/wonli/apic/v2"
+	"golang.org/x/text/unicode/norm"
 )
 
 const defaultBaseURL = "https://musicbrainz.org/ws/2"
@@ -47,8 +49,9 @@ type recording struct {
 	Title        string `json:"title"`
 	Length       int    `json:"length"`
 	ArtistCredit []struct {
-		Name   string `json:"name"`
-		Artist struct {
+		Name       string `json:"name"`
+		JoinPhrase string `json:"joinphrase"`
+		Artist     struct {
 			Name string `json:"name"`
 		} `json:"artist"`
 	} `json:"artist-credit"`
@@ -78,61 +81,92 @@ func (c *Client) Search(ctx context.Context, title, artist, album string) (Resul
 	if title == "" && artist == "" {
 		return Result{}, errors.New("musicbrainz search requires title or artist")
 	}
-	parts := make([]string, 0, 3)
-	if title != "" {
-		parts = append(parts, `recording:"`+escapeQuery(title)+`"`)
+	if title == "" {
+		return Result{}, ErrNoMatch
 	}
+	query := "recording:" + searchPhrase(title)
 	if artist != "" {
-		parts = append(parts, `artist:"`+escapeQuery(artist)+`"`)
+		phrase := searchPhrase(artist)
+		artistQuery := "artist:" + phrase + " OR artistname:" + phrase
+		if lead, _, found := strings.Cut(normalizeArtistCredit(artist), " & "); found && lead != "" {
+			artistQuery += " OR artist:" + searchPhrase(lead)
+		}
+		query += " AND (" + artistQuery + ")"
 	}
 	if album != "" {
-		parts = append(parts, `release:"`+escapeQuery(album)+`"`)
+		// A release match improves ranking without filtering out compilations
+		// or recordings found under a different release title.
+		query = "+(" + query + ") release:" + searchPhrase(album)
 	}
-	query := strings.Join(parts, " AND ")
 	var response recordingSearch
-	err := (&endpoint{client: c, path: "/recording", query: url.Values{"query": {query}, "limit": {"5"}, "fmt": {"json"}, "inc": {"releases+artist-credits+release-groups"}}}).call(ctx, &response)
+	err := (&endpoint{client: c, path: "/recording", query: url.Values{"query": {query}, "limit": {"20"}, "fmt": {"json"}, "inc": {"releases+artist-credits+release-groups"}}}).call(ctx, &response)
 	if err != nil {
 		return Result{}, err
 	}
-	if len(response.Recordings) == 0 {
-		return Result{}, ErrNoMatch
-	}
-	var fallback *Result
-	for index := range response.Recordings {
-		item := response.Recordings[index]
-		result := Result{RecordingID: item.ID, Title: item.Title, Album: album}
-		if len(item.ArtistCredit) > 0 {
-			result.Artist = item.ArtistCredit[0].Name
-			if result.Artist == "" {
-				result.Artist = item.ArtistCredit[0].Artist.Name
-			}
-		}
-		if !sameText(title, result.Title) || (artist != "" && !sameText(artist, result.Artist)) {
+	var best Result
+	bestRank := -1
+	for _, item := range response.Recordings {
+		if !sameText(title, item.Title) {
 			continue
+		}
+		creditedArtist := item.creditedArtist()
+		fullCreditMatch := sameText(normalizeArtistCredit(artist), normalizeArtistCredit(creditedArtist))
+		if artist != "" && !fullCreditMatch && !item.matchesLeadArtist(artist) {
+			continue
+		}
+		result := Result{RecordingID: item.ID, Title: item.Title, Artist: creditedArtist, Album: album}
+		// Prefer the requested release, then the full artist credit and exact title.
+		rank := 0
+		if fullCreditMatch {
+			rank += 2
+		}
+		if strings.EqualFold(title, strings.TrimSpace(item.Title)) {
+			rank++
 		}
 		if album == "" && len(item.Releases) > 0 {
 			result.ReleaseID, result.Album = item.Releases[0].ID, item.Releases[0].Title
 			result.ReleaseGroupID = item.Releases[0].ReleaseGroup.ID
 		}
 		for _, release := range item.Releases {
-			if sameText(album, release.Title) {
+			if album != "" && sameText(album, release.Title) {
 				result.ReleaseID, result.Album = release.ID, release.Title
 				result.ReleaseGroupID = release.ReleaseGroup.ID
+				rank += 4
 				break
 			}
 		}
-		if fallback == nil {
-			copy := result
-			fallback = &copy
-		}
-		if album == "" || result.ReleaseID != "" {
-			return result, nil
+		if rank > bestRank {
+			best, bestRank = result, rank
 		}
 	}
-	if fallback != nil {
-		return *fallback, nil
+	if bestRank < 0 {
+		return Result{}, ErrNoMatch
 	}
-	return Result{}, ErrNoMatch
+	return best, nil
+}
+
+func (r recording) creditedArtist() string {
+	var names strings.Builder
+	for i, credit := range r.ArtistCredit {
+		if i > 0 && r.ArtistCredit[i-1].JoinPhrase == "" {
+			names.WriteString(", ")
+		}
+		name := credit.Name
+		if name == "" {
+			name = credit.Artist.Name
+		}
+		names.WriteString(name)
+		names.WriteString(credit.JoinPhrase)
+	}
+	return strings.TrimSpace(names.String())
+}
+
+func (r recording) matchesLeadArtist(artist string) bool {
+	if len(r.ArtistCredit) == 0 {
+		return false
+	}
+	lead := r.ArtistCredit[0]
+	return sameText(artist, lead.Name) || sameText(artist, lead.Artist.Name)
 }
 
 // Check verifies that the MusicBrainz endpoint is reachable without creating
@@ -172,8 +206,30 @@ func escapeQuery(value string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), `"`, `\"`)
 }
 
+func searchPhrase(value string) string {
+	value = strings.Join(strings.Fields(norm.NFKC.String(value)), " ")
+	return `"` + escapeQuery(value) + `"`
+}
+
+var creditJoinPhrases = strings.NewReplacer(" feat. ", " & ", " feat ", " & ", " ft. ", " & ", " ft ", " & ", " featuring ", " & ")
+
+func normalizeArtistCredit(value string) string {
+	value = strings.Join(strings.Fields(norm.NFKC.String(strings.ToLower(value))), " ")
+	return creditJoinPhrases.Replace(value)
+}
+
 func sameText(left, right string) bool {
-	return strings.EqualFold(strings.TrimSpace(left), strings.TrimSpace(right))
+	left, right = strings.TrimSpace(left), strings.TrimSpace(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if strings.EqualFold(left, right) {
+		return true
+	}
+	separator := func(r rune) bool { return unicode.IsSpace(r) || unicode.IsPunct(r) }
+	left = strings.Join(strings.FieldsFunc(norm.NFKC.String(left), separator), " ")
+	right = strings.Join(strings.FieldsFunc(norm.NFKC.String(right), separator), " ")
+	return left != "" && strings.EqualFold(left, right)
 }
 
 type endpoint struct {

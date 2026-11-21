@@ -226,9 +226,14 @@ type Service struct {
 	scrapeOnce              sync.Once
 	scrapeRateMu            sync.Mutex
 	scrapeProviderNext      map[string]time.Time
+	lastScrapeProvider      string
 	scrapeConfigMu          sync.RWMutex
 	scrapeHTTPClient        *http.Client
 	scrapeProviderBaseURL   map[string]string
+	discogsMu               sync.Mutex
+	discogsNextRequest      time.Time
+	discogsPreviews         map[string]*discogsPreview
+	discogsOAuth            discogsOAuthFlow
 	disconnectOnce          sync.Once
 	transcodeSlots          chan struct{}
 	transcodeProfilesMu     sync.RWMutex

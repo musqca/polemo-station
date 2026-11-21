@@ -2,6 +2,7 @@ package musicbrainz
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -48,6 +49,50 @@ func TestSearchChoosesMatchingRecordingWhenFirstResultLacksRelease(t *testing.T)
 	}
 	if result.RecordingID != "right-recording" || result.ReleaseID != "right-release" {
 		t.Fatalf("matching recording was not selected: %+v", result)
+	}
+}
+
+func TestSearchMatchesSongWithoutMatchingAlbum(t *testing.T) {
+	requests := 0
+	client := NewClient(WithBaseURL("http://musicbrainz.test"), WithHTTPClient(&http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		body := `{"recordings":[{"id":"rec","title":"Song","artist-credit":[{"name":"Artist"}],"releases":[{"id":"different-release","title":"Original Album"}]}]}`
+		if strings.Contains(r.URL.Query().Get("query"), `AND release:"Local Compilation"`) {
+			body = `{"recordings":[]}`
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}))
+	result, err := client.Search(context.Background(), "Song", "Artist", "Local Compilation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 || result.RecordingID != "rec" || result.Album != "Local Compilation" || result.ReleaseID != "" {
+		t.Fatalf("expected the recording in one request without assigning a different release, got %+v in %d requests", result, requests)
+	}
+}
+
+func TestSearchChecksNormalizedTitlesAndArtistCredits(t *testing.T) {
+	const body = `{"recordings":[
+		{"id":"wrong-artist","title":"Song: Tonight","artist-credit":[{"name":"Someone Else"}],"releases":[{"id":"other","title":"Album"}]},
+		{"id":"wrong-version","title":"Song: Tonight (Live)","artist-credit":[{"name":"Lead","joinphrase":" feat. ","artist":{"name":"Lead Artist"}},{"name":"Guest"}]},
+		{"id":"collaboration","title":"Song: Tonight","artist-credit":[{"name":"Lead","joinphrase":" feat. ","artist":{"name":"Lead Artist"}},{"name":"Guest"}],"releases":[{"id":"match","title":"Album"}]}
+	]}`
+	client := NewClient(WithBaseURL("http://musicbrainz.test"), WithHTTPClient(&http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}))
+	for _, artist := range []string{"Lead & Guest", "Lead Artist"} {
+		t.Run(artist, func(t *testing.T) {
+			result, err := client.Search(context.Background(), "Song：  Tonight", artist, "Album")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.RecordingID != "collaboration" || result.Artist != "Lead feat. Guest" || result.ReleaseID != "match" {
+				t.Fatalf("unexpected match: %+v", result)
+			}
+		})
+	}
+	if result, err := client.Search(context.Background(), "Song: Tonight", "Different Artist", "Album"); !errors.Is(err, ErrNoMatch) {
+		t.Fatalf("matched a different artist: %+v, %v", result, err)
 	}
 }
 
