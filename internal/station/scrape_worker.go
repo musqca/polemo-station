@@ -162,21 +162,26 @@ func (s *Service) claimScrapeItem() (*ScrapeItem, error) {
 							AND TRIM(COALESCE(CASE WHEN ? = 'fanarttv' THEN mb.related_external_id ELSE mb.external_id END, '')) = ''
 					)`, musicBrainzUnfinishedStates, provider)
 			}
-			err := query.Order("created_at asc").First(&item).Error
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				continue
-			}
+			var items []ScrapeItem
+			err := query.Order("created_at asc").Limit(1).Find(&items).Error
 			if err != nil {
 				return err
 			}
+			if len(items) == 0 {
+				continue
+			}
+			item = items[0]
 			return s.startClaimedScrapeItem(tx, &item, now)
 		}
-		return gorm.ErrRecordNotFound
+		return nil
 	})
-	if errors.Is(err, gorm.ErrRecordNotFound) {
+	if err != nil {
+		return nil, err
+	}
+	if item.ID == 0 {
 		return nil, nil
 	}
-	return &item, err
+	return &item, nil
 }
 
 func (s *Service) startClaimedScrapeItem(tx *gorm.DB, item *ScrapeItem, now time.Time) error {
