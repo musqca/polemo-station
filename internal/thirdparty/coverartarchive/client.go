@@ -16,6 +16,7 @@ import (
 )
 
 const defaultBaseURL = "https://coverartarchive.org"
+const maxCoverDataSize = int64(30 * 1024 * 1024)
 
 type Client struct {
 	baseURL    string
@@ -38,12 +39,43 @@ func NewClient(opts ...Option) *Client {
 }
 
 type response struct {
-	Images []struct {
-		Image    string   `json:"image"`
-		Types    []string `json:"types"`
-		Front    bool     `json:"front"`
-		Approved bool     `json:"approved"`
-	} `json:"images"`
+	Images []responseImage `json:"images"`
+}
+
+type responseImage struct {
+	Image      string            `json:"image"`
+	Thumbnails map[string]string `json:"thumbnails"`
+	Types      []string          `json:"types"`
+	Front      bool              `json:"front"`
+	Approved   bool              `json:"approved"`
+}
+
+func (c *Client) buildCandidateURLs(img *responseImage) []string {
+	var candidates []string
+	add := func(raw string) {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return
+		}
+		for _, u := range candidates {
+			if u == trimmed {
+				return
+			}
+		}
+		candidates = append(candidates, trimmed)
+	}
+
+	if img.Thumbnails != nil {
+		add(img.Thumbnails["1200"])
+	}
+	add(img.Image)
+	if img.Thumbnails != nil {
+		add(img.Thumbnails["large"])
+		add(img.Thumbnails["500"])
+		add(img.Thumbnails["small"])
+		add(img.Thumbnails["250"])
+	}
+	return candidates
 }
 
 func (c *Client) Front(ctx context.Context, releaseID string) ([]byte, string, error) {
@@ -55,28 +87,57 @@ func (c *Client) Front(ctx context.Context, releaseID string) ([]byte, string, e
 	if err := (&endpoint{client: c, path: "/release/" + releaseID}).call(ctx, &listing); err != nil {
 		return nil, "", err
 	}
-	imageURL := ""
-	for _, image := range listing.Images {
-		if image.Front && image.Approved {
-			imageURL = image.Image
+	var selected *responseImage
+	for i := range listing.Images {
+		img := &listing.Images[i]
+		if img.Front && img.Approved {
+			selected = img
 			break
 		}
 	}
-	if imageURL == "" && len(listing.Images) > 0 {
-		imageURL = listing.Images[0].Image
+	if selected == nil {
+		for i := range listing.Images {
+			img := &listing.Images[i]
+			if img.Front {
+				selected = img
+				break
+			}
+		}
 	}
-	if imageURL == "" {
+	if selected == nil && len(listing.Images) > 0 {
+		selected = &listing.Images[0]
+	}
+	if selected == nil {
 		return nil, "", ErrNoCover
 	}
-	var data []byte
-	if err := (&endpoint{client: c, url: imageURL}).callBytes(ctx, &data); err != nil {
-		return nil, "", err
+
+	candidates := c.buildCandidateURLs(selected)
+	if len(candidates) == 0 {
+		return nil, "", ErrNoCover
 	}
-	mime := http.DetectContentType(data)
-	if mime != "image/jpeg" && mime != "image/png" {
-		return nil, "", fmt.Errorf("cover art has unsupported content type %s", mime)
+
+	var lastErr error
+	for _, imageURL := range candidates {
+		var data []byte
+		if err := (&endpoint{client: c, url: imageURL}).callBytes(ctx, &data); err != nil {
+			lastErr = err
+			continue
+		}
+		if int64(len(data)) > maxCoverDataSize {
+			lastErr = fmt.Errorf("cover art response exceeds %d bytes", maxCoverDataSize)
+			continue
+		}
+		mime := http.DetectContentType(data)
+		if mime != "image/jpeg" && mime != "image/png" {
+			lastErr = fmt.Errorf("cover art has unsupported content type %s", mime)
+			continue
+		}
+		return data, mime, nil
 	}
-	return data, mime, nil
+	if lastErr != nil {
+		return nil, "", lastErr
+	}
+	return nil, "", ErrNoCover
 }
 
 // Check performs a read-only request against the service root. It does not
@@ -161,10 +222,10 @@ func (e *endpoint) callBytes(ctx context.Context, out *[]byte) error {
 	client := apic.NewApiClient().WithContext(ctx)
 	if e.client.httpClient != nil {
 		clone := *e.client.httpClient
-		clone.Transport = limitedResponseTransport{base: e.client.httpClient.Transport, max: 15 << 20}
+		clone.Transport = limitedResponseTransport{base: e.client.httpClient.Transport, max: maxCoverDataSize}
 		client.WithHTTPClient(&clone)
 	} else {
-		client.WithHTTPClient(&http.Client{Transport: limitedResponseTransport{max: 15 << 20}})
+		client.WithHTTPClient(&http.Client{Transport: limitedResponseTransport{max: maxCoverDataSize}})
 	}
 	if err := client.Call(&id, &apic.Options{Timeout: e.client.timeout}); err != nil {
 		return err
@@ -175,7 +236,10 @@ func (e *endpoint) callBytes(ctx context.Context, out *[]byte) error {
 	if id.Response.HttpStatus == http.StatusNoContent {
 		return ErrNoCover
 	}
-	value, err := io.ReadAll(io.LimitReader(bytes.NewReader(id.Response.Data), 15<<20))
+	if int64(len(id.Response.Data)) > maxCoverDataSize {
+		return fmt.Errorf("cover art response exceeds %d bytes", maxCoverDataSize)
+	}
+	value, err := io.ReadAll(bytes.NewReader(id.Response.Data))
 	if err != nil {
 		return err
 	}

@@ -15,7 +15,7 @@ import (
 	"gorm.io/gorm"
 )
 
-const maxCoverSize = int64(10 * 1024 * 1024)
+const maxCoverSize = int64(30 * 1024 * 1024)
 
 type MetadataUpdate struct {
 	Title       string
