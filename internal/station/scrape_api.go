@@ -127,7 +127,7 @@ func (s *Service) SaveScrapeProvider(provider string, enabled bool, apiKey *stri
 		if provider == discogsProvider {
 			return errors.New("connect a Discogs account or configure a personal access token before enabling Discogs")
 		}
-		return errors.New("fanart.tv API key is required before enabling this provider")
+		return fmt.Errorf("%s API key is required before enabling this provider", provider)
 	}
 	config.UpdatedAt = time.Now()
 	// The configured SQL logger may expand bound values on slow queries and errors.
@@ -169,7 +169,7 @@ func isScrapeProvider(value string) bool {
 }
 
 func scrapeProviderRequiresAPIKey(value string) bool {
-	return value == "fanarttv" || value == discogsProvider
+	return value == "fanarttv" || value == discogsProvider || value == musixmatchProvider
 }
 
 func (s *Service) TestScrapeProvider(provider string) error {
@@ -225,6 +225,12 @@ func (s *Service) TestScrapeProvider(provider string) error {
 			options = append(options, fanarttv.WithBaseURL(baseURL))
 		}
 		return fanarttv.NewClient(options...).Check(ctx)
+	case musixmatchProvider:
+		config, err := s.providerConfig(provider)
+		if err != nil {
+			return err
+		}
+		return s.newMusixmatchClient(config, settings).Check(ctx)
 	case "lrclib":
 		options := []lrclib.Option{lrclib.WithTimeout(timeout)}
 		if httpClient != nil {
@@ -305,9 +311,15 @@ func (s *Service) enqueueScrapeProvider(file ServerFile, config ThirdPartyProvid
 	if config.Provider == "lrclib" {
 		return s.queueLyricsScrapeIfReady(file, settings)
 	}
+	if config.Provider == musixmatchProvider {
+		title, _, _, err := s.lyricsQuery(file)
+		if err != nil || title == "" {
+			return false, err
+		}
+	}
 	if config.Provider == discogsProvider {
 		query := discogsQuery(file)
-		if query.Title == "" || (query.Artist == "" && query.Album == "") {
+		if query.Title == "" || (query.Artist == "" && query.Album == "" && strings.TrimSpace(file.Title) == "") {
 			return false, nil
 		}
 	}
@@ -341,7 +353,7 @@ func (s *Service) enqueueScrapeProvider(file ServerFile, config ThirdPartyProvid
 }
 
 // ReprocessScrapeProvider starts one provider for the full library. It creates
-// missing tasks and retries failed/no-match ones, while leaving successful work intact.
+// missing tasks, retries failures, and refreshes results from older matching rules.
 func (s *Service) ReprocessScrapeProvider(provider string) (int, error) {
 	_, count, err := s.StartScrapeProvider(provider)
 	return count, err
@@ -366,12 +378,9 @@ func (s *Service) StartScrapeProvider(provider string) (string, int, error) {
 			return "", 0, err
 		}
 	}
-	// Fanart.tv consumes a MusicBrainz release-group ID. Older successful
-	// MusicBrainz rows predate that field, so schedule their enrichment under
-	// the MusicBrainz provider before Fanart.tv enters the queue. Fanart.tv
-	// itself never performs a hidden MusicBrainz request.
-	if provider == "fanarttv" {
-		if err := s.ensureFanartMusicBrainzReleaseGroups(); err != nil {
+	// Cover providers use the MusicBrainz edition or release-group IDs.
+	if provider == "fanarttv" || provider == "coverartarchive" {
+		if err := s.ensureMusicBrainzReleaseGroups(); err != nil {
 			return "", 0, err
 		}
 	}
@@ -411,7 +420,8 @@ func (s *Service) StartScrapeProvider(provider string) (string, int, error) {
 		}
 		needsReleaseGroup := provider == "musicbrainz" && item.ExternalID != "" && item.RelatedExternalID == ""
 		needsDiscogsPreview := provider == discogsProvider && s.discogsMatch(file.ServerFileID) == nil
-		if item.State == ScrapeSuccess && !needsReleaseGroup && !needsDiscogsPreview {
+		needsCandidateRefresh := provider != discogsProvider && item.CandidateVersion < scrapeCandidateVersion
+		if item.State == ScrapeSuccess && !needsReleaseGroup && !needsDiscogsPreview && !needsCandidateRefresh {
 			skippedSuccess++
 			continue
 		}
@@ -419,6 +429,7 @@ func (s *Service) StartScrapeProvider(provider string) (string, int, error) {
 			if err := s.db.Model(&item).Updates(map[string]any{
 				"state": ScrapePending, "failure_count": 0, "next_retry_at": nil,
 				"last_error": "", "last_error_code": "", "finished_at": nil, "lease_until": nil, "run_id": runID,
+				"dependency_wait_count": 0, "added_count": 0,
 			}).Error; err != nil {
 				return "", count, err
 			}
@@ -458,11 +469,8 @@ func (s *Service) StartScrapeProvider(provider string) (string, int, error) {
 	return runID, count, nil
 }
 
-// ensureFanartMusicBrainzReleaseGroups creates a visible MusicBrainz run for
-// legacy successful rows that have a release ID but predate release-group ID
-// storage. It deliberately schedules the prerequisite provider rather than
-// issuing MusicBrainz HTTP calls from Fanart.tv.
-func (s *Service) ensureFanartMusicBrainzReleaseGroups() error {
+// ensureMusicBrainzReleaseGroups schedules legacy editions for release-group lookup.
+func (s *Service) ensureMusicBrainzReleaseGroups() error {
 	var missingReleaseGroups int64
 	if err := s.db.Model(&ScrapeItem{}).Where("provider = ? AND state = ? AND external_id <> '' AND related_external_id = ''", "musicbrainz", ScrapeSuccess).Count(&missingReleaseGroups).Error; err != nil {
 		return err

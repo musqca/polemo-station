@@ -2,7 +2,6 @@ package musicbrainz
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -66,8 +65,8 @@ func TestSearchMatchesSongWithoutMatchingAlbum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requests != 1 || result.RecordingID != "rec" || result.Album != "Local Compilation" || result.ReleaseID != "" {
-		t.Fatalf("expected the recording in one request without assigning a different release, got %+v in %d requests", result, requests)
+	if requests != 1 || result.RecordingID != "rec" || result.Album != "Original Album" || result.ReleaseID != "different-release" {
+		t.Fatalf("expected the available release in one request, got %+v in %d requests", result, requests)
 	}
 }
 
@@ -91,8 +90,8 @@ func TestSearchChecksNormalizedTitlesAndArtistCredits(t *testing.T) {
 			}
 		})
 	}
-	if result, err := client.Search(context.Background(), "Song: Tonight", "Different Artist", "Album"); !errors.Is(err, ErrNoMatch) {
-		t.Fatalf("matched a different artist: %+v, %v", result, err)
+	if result, err := client.Search(context.Background(), "Song: Tonight", "Different Artist", "Album"); err != nil || result.Title != "Song: Tonight" {
+		t.Fatalf("missing fallback for a different artist: %+v, %v", result, err)
 	}
 }
 

@@ -538,6 +538,22 @@ func Api(g *gin.Engine, syncService *station.Service) {
 		}
 		c.JSON(http.StatusOK, file)
 	})
+	stationAPI.DELETE("/resources/:resourceId", func(c *gin.Context) {
+		file, err := syncService.DeleteResource(c.Param("resourceId"))
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "resource_not_found"})
+			return
+		}
+		c.JSON(http.StatusOK, file)
+	})
+	stationAPI.POST("/resources/:resourceId/delete", func(c *gin.Context) {
+		file, err := syncService.DeleteResource(c.Param("resourceId"))
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "resource_not_found"})
+			return
+		}
+		c.JSON(http.StatusOK, file)
+	})
 	stationAPI.POST("/files/:serverFileId/metadata", func(c *gin.Context) {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 13<<20)
 		if err := c.Request.ParseMultipartForm(12 << 20); err != nil {
@@ -549,6 +565,7 @@ func Api(g *gin.Engine, syncService *station.Service) {
 		update := station.MetadataUpdate{
 			Title: c.PostForm("title"), Artist: c.PostForm("artist"), Album: c.PostForm("album"),
 			AlbumArtist: c.PostForm("albumArtist"), Lyrics: c.PostForm("lyrics"),
+			KeepLyrics:  c.PostForm("keepLyrics") == "true",
 			TrackNumber: trackNumber, DiscNumber: discNumber, RemoveCover: c.PostForm("removeCover") == "true",
 		}
 		cover, header, err := c.Request.FormFile("cover")

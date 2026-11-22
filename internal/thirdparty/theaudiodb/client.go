@@ -54,11 +54,22 @@ type Result struct {
 var ErrNoMatch = errors.New("theaudiodb album not found")
 
 func (c *Client) Album(ctx context.Context, artist, album string) (Result, error) {
-	artist, album = strings.TrimSpace(artist), strings.TrimSpace(album)
-	if artist == "" || album == "" {
-		return Result{}, ErrNoMatch
+	results, err := c.Albums(ctx, artist, album, 1)
+	if err != nil {
+		return Result{}, err
 	}
-	query := url.Values{"s": {artist}, "a": {album}}
+	return results[0], nil
+}
+
+func (c *Client) Albums(ctx context.Context, artist, album string, limit int) ([]Result, error) {
+	artist, album = strings.TrimSpace(artist), strings.TrimSpace(album)
+	if album == "" {
+		return nil, ErrNoMatch
+	}
+	query := url.Values{"a": {album}}
+	if artist != "" {
+		query.Set("s", artist)
+	}
 	var response struct {
 		Albums []struct {
 			Title  string `json:"strAlbum"`
@@ -67,27 +78,46 @@ func (c *Client) Album(ctx context.Context, artist, album string) (Result, error
 		} `json:"album"`
 	}
 	if err := c.getJSON(ctx, "/"+c.apiKey+"/searchalbum.php?"+query.Encode(), &response); err != nil {
-		return Result{}, err
+		return nil, err
 	}
-	if len(response.Albums) == 0 {
-		return Result{}, ErrNoMatch
-	}
-	first := response.Albums[0]
-	result := Result{Title: album, Artist: artist, Album: first.Title}
-	if strings.TrimSpace(first.Artist) != "" {
-		result.Artist = strings.TrimSpace(first.Artist)
-	}
-	if result.Album == "" {
-		result.Album = album
-	}
-	if strings.TrimSpace(first.Cover) != "" {
-		data, mimeType, err := c.download(ctx, first.Cover)
-		if err != nil {
-			return Result{}, err
+	var results []Result
+	var coverErr error
+	coverCount := 0
+	seen := make(map[string]bool)
+	for index, candidate := range response.Albums {
+		if index >= limit*3 || coverCount >= limit {
+			break
 		}
-		result.Cover, result.MIME = data, mimeType
+		title, credit, artwork := strings.TrimSpace(candidate.Title), strings.TrimSpace(candidate.Artist), strings.TrimSpace(candidate.Cover)
+		if title == "" && credit == "" && artwork == "" {
+			continue
+		}
+		result := Result{Title: album, Artist: credit, Album: title}
+		if result.Artist == "" {
+			result.Artist = artist
+		}
+		if result.Album == "" {
+			result.Album = album
+		}
+		if artwork != "" && !seen[artwork] {
+			seen[artwork] = true
+			data, mime, err := c.download(ctx, artwork)
+			if err != nil && !errors.Is(err, ErrNoMatch) {
+				coverErr = err
+			}
+			result.Cover, result.MIME = data, mime
+		}
+		if len(result.Cover) > 0 {
+			coverCount++
+		}
+		if index < limit || len(result.Cover) > 0 {
+			results = append(results, result)
+		}
 	}
-	return result, nil
+	if len(results) == 0 {
+		return nil, ErrNoMatch
+	}
+	return results, coverErr
 }
 
 func (c *Client) Check(ctx context.Context) error {

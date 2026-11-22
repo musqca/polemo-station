@@ -95,11 +95,41 @@ func (c *Client) Check(ctx context.Context) error {
 }
 
 func (c *Client) Search(ctx context.Context, input Query) (Result, error) {
-	query := normalizedQuery(input)
-	if query.Title == "" || (query.Artist == "" && query.Album == "") {
-		return Result{}, ErrNoMatch
+	matches, err := c.search(ctx, input, false, 1)
+	if err != nil {
+		return Result{}, err
 	}
+	return normalizedQuery(input).bestMatch(matches)
+}
 
+func (c *Client) Candidates(ctx context.Context, input Query, limit int) ([]Result, error) {
+	matches, err := c.search(ctx, input, true, limit)
+	if err != nil {
+		return nil, err
+	}
+	sortMatches(matches)
+	var candidates []Result
+	seen := make(map[string]bool)
+	for _, match := range matches {
+		if !seen[match.ReleaseURL] {
+			candidates = append(candidates, match.Result)
+			seen[match.ReleaseURL] = true
+		}
+		if len(candidates) == limit {
+			break
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, ErrNoMatch
+	}
+	return candidates, nil
+}
+
+func (c *Client) search(ctx context.Context, input Query, alternatives bool, candidateLimit int) ([]trackMatch, error) {
+	query := normalizedQuery(input)
+	if query.Title == "" || (!alternatives && query.Artist == "" && query.Album == "") {
+		return nil, ErrNoMatch
+	}
 	var filters []url.Values
 	if query.Album != "" {
 		filters = append(filters, url.Values{"release_title": {strings.TrimSpace(input.Album)}})
@@ -117,24 +147,37 @@ func (c *Client) Search(ctx context.Context, input Query) (Result, error) {
 		filter.Set("track", strings.TrimSpace(input.Title))
 		var search searchResponse
 		if err := c.get(ctx, "database/search", filter, &search); err != nil {
-			return Result{}, err
+			if alternatives && len(matches) > 0 {
+				return matches, nil
+			}
+			return nil, err
 		}
-		// Reserve one detail request for each remaining search, including
-		// a track-only fallback that can find compilations and artist variations.
+		// Reserve one detail request for every remaining search.
 		limit := maxReleases - (len(filters) - i - 1)
-		found, err := c.inspectReleases(ctx, query, search.Results, seen, limit)
-		if err != nil {
-			return Result{}, err
-		}
+		found, err := c.inspectReleases(ctx, query, search.Results, seen, limit, alternatives)
 		matches = append(matches, found...)
-		if best, err := query.bestMatch(matches); err == nil && (query.Album == "" || best.Album != "") {
-			return best, nil
+		if err != nil {
+			if alternatives && len(matches) > 0 {
+				return matches, nil
+			}
+			return nil, err
+		}
+		if alternatives {
+			releases := make(map[string]bool)
+			for _, match := range matches {
+				releases[match.ReleaseURL] = true
+			}
+			if len(releases) >= candidateLimit {
+				break
+			}
+		} else if best, err := query.bestMatch(matches); err == nil && (query.Album == "" || best.Album != "") {
+			break
 		}
 	}
-	return query.bestMatch(matches)
+	return matches, nil
 }
 
-func (c *Client) inspectReleases(ctx context.Context, query matchQuery, results []searchResult, seen map[int64]struct{}, limit int) ([]trackMatch, error) {
+func (c *Client) inspectReleases(ctx context.Context, query matchQuery, results []searchResult, seen map[int64]struct{}, limit int, alternatives bool) ([]trackMatch, error) {
 	slices.SortStableFunc(results, func(a, b searchResult) int {
 		return query.releasePriority(b.Title) - query.releasePriority(a.Title)
 	})
@@ -157,12 +200,12 @@ func (c *Client) inspectReleases(ctx context.Context, query matchQuery, results 
 			if errors.As(err, &status) && status.StatusCode == http.StatusNotFound {
 				continue
 			}
-			return nil, err
+			return matches, err
 		}
 		if release.ID != 0 && release.ID != found.ID {
 			continue
 		}
-		matches = append(matches, query.match(release, "https://www.discogs.com/release/"+id)...)
+		matches = append(matches, query.match(release, "https://www.discogs.com/release/"+id, alternatives)...)
 	}
 
 	return matches, nil

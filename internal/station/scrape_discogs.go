@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/musqca/polemo-station/internal/thirdparty/discogs"
-	"gorm.io/gorm"
 )
 
 const (
@@ -21,8 +20,9 @@ const (
 
 type discogsPreview struct {
 	discogs.Result
-	FileName  string    `json:"fileName"`
-	ExpiresAt time.Time `json:"expiresAt"`
+	FileName     string           `json:"fileName"`
+	ExpiresAt    time.Time        `json:"expiresAt"`
+	Alternatives []discogs.Result `json:"alternatives,omitempty"`
 }
 
 func discogsQuery(file ServerFile) discogs.Query {
@@ -84,23 +84,21 @@ func (s *Service) scrapeDiscogs(ctx context.Context, item *ScrapeItem, settings 
 		return err
 	}
 	query := discogsQuery(file)
-	var track Track
-	err = s.db.Select("duration_ms").Where("server_file_id = ? AND duration_ms > 0", file.ServerFileID).
-		Order("last_seen_at DESC").First(&track).Error
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+	query.Duration, err = s.scrapeTrackDuration(file.ServerFileID)
+	if err != nil {
 		return err
 	}
-	query.Duration = time.Duration(track.DurationMs) * time.Millisecond
-	result, err := s.newDiscogsClient(config, time.Duration(settings.RequestTimeoutSeconds)*time.Second).Search(ctx, query)
+	results, err := s.newDiscogsClient(config, time.Duration(settings.RequestTimeoutSeconds)*time.Second).
+		Candidates(ctx, query, scrapeTitleResultLimit)
 	if err != nil {
 		return s.handleDiscogsError(err)
 	}
-	s.cacheDiscogsMatch(item.ServerFileID, file.FileName, result)
+	s.cacheDiscogsMatch(item.ServerFileID, file.FileName, results)
 	return nil
 }
 
-func (s *Service) cacheDiscogsMatch(fileID, fileName string, result discogs.Result) {
-	preview := &discogsPreview{Result: result, FileName: fileName, ExpiresAt: time.Now().Add(discogsPreviewTTL)}
+func (s *Service) cacheDiscogsMatch(fileID, fileName string, results []discogs.Result) {
+	preview := &discogsPreview{Result: results[0], FileName: fileName, ExpiresAt: time.Now().Add(discogsPreviewTTL), Alternatives: results[1:]}
 	s.discogsMu.Lock()
 	if s.discogsPreviews == nil {
 		s.discogsPreviews = make(map[string]*discogsPreview)

@@ -2,35 +2,46 @@ package fanarttv
 
 import (
 	"context"
+	"io"
 	"net/http"
-	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
-func TestAlbumCoverUsesPersonalKeyAndDownloadsArtwork(t *testing.T) {
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.Header.Get("client-key") != "personal-key" {
-			t.Fatalf("client-key = %q, want personal-key", request.Header.Get("client-key"))
-		}
+type testTransport func(*http.Request) (*http.Response, error)
+
+func (transport testTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
+func TestAlbumCoversSkipBrokenImagesAndKeepAlternatives(t *testing.T) {
+	client := &http.Client{Transport: testTransport(func(request *http.Request) (*http.Response, error) {
+		status := http.StatusOK
+		var body string
 		switch request.URL.Path {
 		case "/music/albums/group-1":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"albums":[{"release_group_id":"group-1","albumcover":[{"url":"` + server.URL + `/cover.jpg"}]}]}`))
-		case "/cover.jpg":
-			w.Header().Set("Content-Type", "image/jpeg")
-			_, _ = w.Write([]byte{0xff, 0xd8, 0xff, 0xd9})
+			if got := request.Header.Get("client-key"); got != "personal-key" {
+				t.Errorf("API client-key = %q, want personal-key", got)
+			}
+			body = `{"albums":[{"release_group_id":"group-1","albumcover":[
+				{"url":"https://artwork.test/missing.jpg"},{"url":"https://artwork.test/first.jpg"},
+				{"url":"https://artwork.test/second.jpg"}
+			]}]}`
+		case "/missing.jpg":
+			status = http.StatusNotFound
+		case "/first.jpg", "/second.jpg":
+			body = "\xff\xd8\xff" + request.URL.Path
 		default:
-			http.NotFound(w, request)
+			t.Fatalf("unexpected request: %s", request.URL)
 		}
-	}))
-	defer server.Close()
-
-	data, mime, err := NewClient(WithBaseURL(server.URL), WithAPIKey("personal-key")).AlbumCover(context.Background(), "group-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mime != "image/jpeg" || len(data) == 0 {
-		t.Fatalf("cover = %d bytes %q, want JPEG", len(data), mime)
+		if request.URL.Host == "artwork.test" && request.Header.Get("client-key") != "" {
+			t.Error("artwork request contained the API key")
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	covers, err := NewClient(WithBaseURL("https://fanart.test"), WithAPIKey("personal-key"), WithHTTPClient(client)).
+		AlbumCovers(context.Background(), "group-1", 3)
+	if err != nil || len(covers) != 2 || covers[0].MIME != "image/jpeg" || string(covers[1].Data[3:]) != "/second.jpg" {
+		t.Fatalf("wanted two usable alternate covers, got %+v, %v", covers, err)
 	}
 }

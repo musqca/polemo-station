@@ -23,6 +23,7 @@ type MetadataUpdate struct {
 	Album       string
 	AlbumArtist string
 	Lyrics      string
+	KeepLyrics  bool
 	TrackNumber int
 	DiscNumber  int
 	Cover       []byte
@@ -123,6 +124,9 @@ func (s *Service) serverFileView(file ServerFile) (ServerFileView, error) {
 		}
 		view.Resources = append(view.Resources, resourceView)
 	}
+	if view.Lyrics == "" {
+		view.Lyrics = fallbackLyrics(resources)
+	}
 	view.MissingMetadata = strings.TrimSpace(file.Title) == "" || strings.TrimSpace(file.Artist) == "" ||
 		strings.TrimSpace(file.Album) == ""
 	hasAudio := s.HasAudioFile(file)
@@ -150,8 +154,36 @@ func (s *Service) HasAudioFile(file ServerFile) bool {
 	return false
 }
 
+func fallbackLyrics(resources []MetadataResource) string {
+	var plain, synced string
+	for _, resource := range resources {
+		if resource.Type != "lyrics" {
+			continue
+		}
+		if resource.LastUseAt != nil && resource.Deleted {
+			return ""
+		}
+		if resource.Deleted || resource.Data == "" {
+			continue
+		}
+		if resource.LastUseAt != nil || !isScrapedMetadataSource(resource.Source) {
+			return resource.Data
+		}
+		if resource.Format == "lrc" && synced == "" {
+			synced = resource.Data
+		}
+		if plain == "" {
+			plain = resource.Data
+		}
+	}
+	if synced != "" {
+		return synced
+	}
+	return plain
+}
+
 func isScrapedMetadataSource(source string) bool {
-	return source == "musicbrainz" || source == "coverartarchive" || source == "lrclib"
+	return isScrapeProvider(source)
 }
 
 func activeCoverResource(resources []MetadataResource) (MetadataResource, error) {
@@ -233,14 +265,16 @@ func (s *Service) UpdateServerFileMetadata(id string, update MetadataUpdate) (Se
 	resources := []MetadataResource{newTextResource(id, "metadata", "json", "", string(metadataJSON), false, now)}
 
 	lyrics := normalizeLyrics(update.Lyrics)
-	if lyrics != "" {
-		format := "plain"
-		if strings.Contains(lyrics, "[") && strings.Contains(lyrics, ":") {
-			format = "lrc"
+	if !update.KeepLyrics {
+		if lyrics != "" {
+			format := "plain"
+			if strings.Contains(lyrics, "[") && strings.Contains(lyrics, ":") {
+				format = "lrc"
+			}
+			resources = append(resources, newTextResource(id, "lyrics", format, "", lyrics, false, now))
+		} else {
+			resources = append(resources, newTextResource(id, "lyrics", "plain", "", "", true, now))
 		}
-		resources = append(resources, newTextResource(id, "lyrics", format, "", lyrics, false, now))
-	} else {
-		resources = append(resources, newTextResource(id, "lyrics", "plain", "", "", true, now))
 	}
 
 	var coverResource *MetadataResource
@@ -270,11 +304,14 @@ func (s *Service) UpdateServerFileMetadata(id string, update MetadataUpdate) (Se
 				return err
 			}
 		}
-		return tx.Model(&ServerFile{}).Where("server_file_id = ?", id).Updates(map[string]any{
+		updates := map[string]any{
 			"title": snapshot.Title, "artist": snapshot.Artist, "album": snapshot.Album,
-			"album_artist": snapshot.AlbumArtist, "lyrics": lyrics,
-			"track_number": snapshot.Track, "disc_number": snapshot.Disc,
-		}).Error
+			"album_artist": snapshot.AlbumArtist, "track_number": snapshot.Track, "disc_number": snapshot.Disc,
+		}
+		if !update.KeepLyrics {
+			updates["lyrics"] = lyrics
+		}
+		return tx.Model(&ServerFile{}).Where("server_file_id = ?", id).Updates(updates).Error
 	})
 	if err != nil {
 		return ServerFileView{}, err
@@ -385,6 +422,46 @@ func (s *Service) ActivateResource(resourceID string) (ServerFileView, error) {
 	if err := s.db.Where("server_file_id = ?", resource.ServerFileID).First(&file).Error; err != nil {
 		return ServerFileView{}, err
 	}
+	s.emitServerFileChanged(file)
+	s.broadcastMetadataUpdated(file.ServerFileID)
+	return s.serverFileView(file)
+}
+
+func (s *Service) DeleteResource(resourceID string) (ServerFileView, error) {
+	var resource MetadataResource
+	if err := s.db.Where("resource_id = ?", resourceID).First(&resource).Error; err != nil {
+		return ServerFileView{}, err
+	}
+	if err := s.db.Model(&resource).Update("deleted", true).Error; err != nil {
+		return ServerFileView{}, err
+	}
+	var file ServerFile
+	if err := s.db.Where("server_file_id = ?", resource.ServerFileID).First(&file).Error; err != nil {
+		return ServerFileView{}, err
+	}
+
+	var nextResource MetadataResource
+	err := s.db.Where("server_file_id = ? AND type = ? AND deleted = ?", resource.ServerFileID, resource.Type, false).
+		Order("last_use_at desc, created_at desc").First(&nextResource).Error
+	if err == nil {
+		switch nextResource.Type {
+		case "metadata":
+			var snapshot metadataSnapshot
+			if jsonErr := json.Unmarshal([]byte(nextResource.Data), &snapshot); jsonErr == nil {
+				_ = s.db.Model(&file).Updates(map[string]any{
+					"title": snapshot.Title, "artist": snapshot.Artist, "album": snapshot.Album,
+					"album_artist": snapshot.AlbumArtist, "track_number": snapshot.Track, "disc_number": snapshot.Disc,
+				}).Error
+			}
+		case "lyrics":
+			_ = s.db.Model(&file).Update("lyrics", nextResource.Data).Error
+		}
+	} else if errors.Is(err, gorm.ErrRecordNotFound) {
+		if resource.Type == "lyrics" {
+			_ = s.db.Model(&file).Update("lyrics", "").Error
+		}
+	}
+
 	s.emitServerFileChanged(file)
 	s.broadcastMetadataUpdated(file.ServerFileID)
 	return s.serverFileView(file)

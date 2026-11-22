@@ -1,12 +1,14 @@
 package musicbrainz
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -55,14 +57,15 @@ type recording struct {
 			Name string `json:"name"`
 		} `json:"artist"`
 	} `json:"artist-credit"`
-	Releases []struct {
-		ID           string `json:"id"`
-		Title        string `json:"title"`
-		Date         string `json:"date"`
-		ReleaseGroup struct {
-			ID string `json:"id"`
-		} `json:"release-group"`
-	} `json:"releases"`
+	Releases []release `json:"releases"`
+}
+
+type release struct {
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	ReleaseGroup struct {
+		ID string `json:"id"`
+	} `json:"release-group"`
 }
 
 type Result struct {
@@ -77,72 +80,88 @@ type Result struct {
 }
 
 func (c *Client) Search(ctx context.Context, title, artist, album string) (Result, error) {
+	results, err := c.Candidates(ctx, title, artist, album, 1)
+	if err != nil {
+		return Result{}, err
+	}
+	return results[0], nil
+}
+
+func (c *Client) Candidates(ctx context.Context, title, artist, album string, limit int) ([]Result, error) {
 	title, artist, album = strings.TrimSpace(title), strings.TrimSpace(artist), strings.TrimSpace(album)
-	if title == "" && artist == "" {
-		return Result{}, errors.New("musicbrainz search requires title or artist")
-	}
 	if title == "" {
-		return Result{}, ErrNoMatch
+		return nil, ErrNoMatch
 	}
-	query := "recording:" + searchPhrase(title)
+	query := "+(recording:" + searchPhrase(title) + ")"
 	if artist != "" {
 		phrase := searchPhrase(artist)
 		artistQuery := "artist:" + phrase + " OR artistname:" + phrase
 		if lead, _, found := strings.Cut(normalizeArtistCredit(artist), " & "); found && lead != "" {
 			artistQuery += " OR artist:" + searchPhrase(lead)
 		}
-		query += " AND (" + artistQuery + ")"
+		query += " (" + artistQuery + ")"
 	}
 	if album != "" {
-		// A release match improves ranking without filtering out compilations
-		// or recordings found under a different release title.
-		query = "+(" + query + ") release:" + searchPhrase(album)
+		query += " release:" + searchPhrase(album)
 	}
 	var response recordingSearch
 	err := (&endpoint{client: c, path: "/recording", query: url.Values{"query": {query}, "limit": {"20"}, "fmt": {"json"}, "inc": {"releases+artist-credits+release-groups"}}}).call(ctx, &response)
 	if err != nil {
-		return Result{}, err
+		return nil, err
 	}
-	var best Result
-	bestRank := -1
+	type rankedResult struct {
+		Result
+		score int
+	}
+	var ranked []rankedResult
 	for _, item := range response.Recordings {
-		if !sameText(title, item.Title) {
+		if strings.TrimSpace(item.Title) == "" {
 			continue
 		}
-		creditedArtist := item.creditedArtist()
-		fullCreditMatch := sameText(normalizeArtistCredit(artist), normalizeArtistCredit(creditedArtist))
-		if artist != "" && !fullCreditMatch && !item.matchesLeadArtist(artist) {
-			continue
+		credit := item.creditedArtist()
+		score := 0
+		if sameText(title, item.Title) {
+			score += 8
 		}
-		result := Result{RecordingID: item.ID, Title: item.Title, Artist: creditedArtist, Album: album}
-		// Prefer the requested release, then the full artist credit and exact title.
-		rank := 0
-		if fullCreditMatch {
-			rank += 2
+		if sameText(normalizeArtistCredit(artist), normalizeArtistCredit(credit)) {
+			score += 4
+		} else if item.matchesLeadArtist(artist) {
+			score += 2
 		}
-		if strings.EqualFold(title, strings.TrimSpace(item.Title)) {
-			rank++
+		releases := item.Releases
+		if len(releases) == 0 {
+			releases = []release{{}}
 		}
-		if album == "" && len(item.Releases) > 0 {
-			result.ReleaseID, result.Album = item.Releases[0].ID, item.Releases[0].Title
-			result.ReleaseGroupID = item.Releases[0].ReleaseGroup.ID
-		}
-		for _, release := range item.Releases {
-			if album != "" && sameText(album, release.Title) {
-				result.ReleaseID, result.Album = release.ID, release.Title
-				result.ReleaseGroupID = release.ReleaseGroup.ID
+		for _, edition := range releases {
+			result := Result{RecordingID: item.ID, Title: item.Title, Artist: credit, Album: edition.Title,
+				ReleaseID: edition.ID, ReleaseGroupID: edition.ReleaseGroup.ID}
+			rank := score
+			if sameText(album, edition.Title) {
 				rank += 4
-				break
 			}
-		}
-		if rank > bestRank {
-			best, bestRank = result, rank
+			if edition.ID != "" {
+				rank++
+			}
+			ranked = append(ranked, rankedResult{Result: result, score: rank})
 		}
 	}
-	if bestRank < 0 {
-		return Result{}, ErrNoMatch
+	slices.SortStableFunc(ranked, func(a, b rankedResult) int { return cmp.Compare(b.score, a.score) })
+	results := make([]Result, 0, limit)
+	seen := make(map[[3]string]bool)
+	for _, candidate := range ranked {
+		key := [3]string{candidate.Title, candidate.Artist, candidate.Album}
+		if !seen[key] {
+			results = append(results, candidate.Result)
+			seen[key] = true
+		}
+		if len(results) == limit {
+			break
+		}
 	}
-	return best, nil
+	if len(results) == 0 {
+		return nil, ErrNoMatch
+	}
+	return results, nil
 }
 
 func (r recording) creditedArtist() string {

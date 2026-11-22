@@ -13,16 +13,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/musqca/polemo-station/internal/thirdparty"
 	"github.com/musqca/polemo-station/internal/thirdparty/coverartarchive"
 	"github.com/musqca/polemo-station/internal/thirdparty/discogs"
 	"github.com/musqca/polemo-station/internal/thirdparty/fanarttv"
 	"github.com/musqca/polemo-station/internal/thirdparty/lrclib"
 	"github.com/musqca/polemo-station/internal/thirdparty/musicbrainz"
+	"github.com/musqca/polemo-station/internal/thirdparty/musixmatch"
 	"github.com/musqca/polemo-station/internal/thirdparty/theaudiodb"
 	"gorm.io/gorm"
 )
 
-var scrapeProviders = []string{discogsProvider, "musicbrainz", "coverartarchive", "fanarttv", "lrclib", "theaudiodb"}
+const scrapeCandidateVersion = 1
+
+var scrapeProviders = []string{discogsProvider, "musicbrainz", "coverartarchive", "fanarttv", "lrclib", musixmatchProvider, "theaudiodb"}
 var musicBrainzUnfinishedStates = []string{ScrapePending, ScrapeRetry, ScrapeRunning, ScrapePaused}
 var errScrapeDependency = errors.New("scrape dependency is not ready")
 var errScrapeProviderDisabled = errors.New("scrape provider is disabled")
@@ -240,6 +244,8 @@ func (s *Service) processScrapeItem(item ScrapeItem) error {
 		processErr = s.scrapeFanartTV(ctx, &item, settings)
 	case "lrclib":
 		processErr = s.scrapeLyrics(ctx, &item, settings)
+	case musixmatchProvider:
+		processErr = s.scrapeMusixmatch(ctx, &item, settings)
 	case "theaudiodb":
 		processErr = s.scrapeTheAudioDB(ctx, &item, settings)
 	default:
@@ -248,7 +254,7 @@ func (s *Service) processScrapeItem(item ScrapeItem) error {
 	if processErr == nil {
 		return s.finishScrapeSuccess(&item)
 	}
-	if errors.Is(processErr, discogs.ErrNoMatch) || errors.Is(processErr, musicbrainz.ErrNoMatch) || errors.Is(processErr, coverartarchive.ErrNoCover) || errors.Is(processErr, fanarttv.ErrNoCover) || errors.Is(processErr, lrclib.ErrNoMatch) || errors.Is(processErr, lrclib.ErrInvalidQuery) || errors.Is(processErr, theaudiodb.ErrNoMatch) {
+	if errors.Is(processErr, discogs.ErrNoMatch) || errors.Is(processErr, musicbrainz.ErrNoMatch) || errors.Is(processErr, coverartarchive.ErrNoCover) || errors.Is(processErr, fanarttv.ErrNoCover) || errors.Is(processErr, lrclib.ErrNoMatch) || errors.Is(processErr, lrclib.ErrInvalidQuery) || errors.Is(processErr, musixmatch.ErrNoMatch) || errors.Is(processErr, theaudiodb.ErrNoMatch) {
 		return s.finishScrapeNoMatch(&item, processErr)
 	}
 	if errors.Is(processErr, errScrapeDependency) {
@@ -335,26 +341,57 @@ func (s *Service) scrapeMusicBrainz(ctx context.Context, item *ScrapeItem, setti
 	if baseURL != "" {
 		clientOptions = append(clientOptions, musicbrainz.WithBaseURL(baseURL))
 	}
-	result, err := musicbrainz.NewClient(clientOptions...).Search(ctx, file.Title, file.Artist, file.Album)
+	client := musicbrainz.NewClient(clientOptions...)
+	results, err := client.Candidates(ctx, file.Title, file.Artist, file.Album, scrapeTitleResultLimit)
 	if err != nil {
-		return err
+		// Older successful rows may have an edition ID even when tags or
+		// the provider's current search results are now unavailable.
+		if !errors.Is(err, musicbrainz.ErrNoMatch) || item.ExternalID == "" || item.RelatedExternalID != "" {
+			return err
+		}
+		groupID, err := client.ReleaseGroupForRelease(ctx, item.ExternalID)
+		if err != nil {
+			return err
+		}
+		item.RelatedExternalID = groupID
+		return nil
 	}
-	data, _ := json.Marshal(metadataSnapshot{Title: result.Title, Artist: result.Artist, Album: result.Album})
-	added, err := s.appendScrapeResource(item.ServerFileID, "metadata", "json", string(data), "musicbrainz", "")
-	if err != nil {
-		return err
+	for _, result := range slices.Backward(results) {
+		data, _ := json.Marshal(metadataSnapshot{Title: result.Title, Artist: result.Artist, Album: result.Album})
+		added, err := s.appendScrapeResource(item.ServerFileID, "metadata", "json", string(data), "musicbrainz", "")
+		if err != nil {
+			return err
+		}
+		item.AddedCount += added
 	}
-	item.AddedCount += added
-	// MusicBrainz metadata remains a candidate resource: it is not written to
-	// the source audio file or automatically made the active file metadata.
-	// A MusicBrainz-only run must not enqueue any downstream provider; those
-	// providers run only when the user explicitly starts them (or starts the
-	// full-library scan).
+	result := results[0]
+	for _, candidate := range results {
+		if candidate.ReleaseID != "" {
+			result = candidate
+			break
+		}
+	}
+	// A metadata-only run does not enqueue an artwork or lyrics run.
+	if result.ReleaseID != "" && result.ReleaseGroupID == "" {
+		// MusicBrainz asks clients to space consecutive requests one second apart.
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		groupID, err := client.ReleaseGroupForRelease(ctx, result.ReleaseID)
+		if err != nil && !errors.Is(err, musicbrainz.ErrNoMatch) {
+			return err
+		}
+		result.ReleaseGroupID = groupID
+	}
 	item.ExternalID = result.ReleaseID
 	item.RelatedExternalID = result.ReleaseGroupID
-	if result.ReleaseID != "" {
+	if result.ReleaseID != "" || result.ReleaseGroupID != "" {
 		_ = s.db.Model(&ScrapeItem{}).Where("server_file_id = ? AND provider = ?", item.ServerFileID, "coverartarchive").
-			Update("external_id", result.ReleaseID).Error
+			Updates(map[string]any{"external_id": result.ReleaseID, "related_external_id": result.ReleaseGroupID}).Error
 	}
 	if result.ReleaseGroupID != "" {
 		_ = s.db.Model(&ScrapeItem{}).Where("server_file_id = ? AND provider = ?", item.ServerFileID, "fanarttv").
@@ -371,8 +408,20 @@ func (s *Service) scrapeCoverArt(ctx context.Context, item *ScrapeItem, settings
 	if !config.Enabled {
 		return errScrapeProviderDisabled
 	}
-	if err := s.resolveScrapeCoverID(item, coverartarchive.ErrNoCover); err != nil {
+	var mb ScrapeItem
+	err = s.db.Where("server_file_id = ? AND provider = ?", item.ServerFileID, "musicbrainz").First(&mb).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
+	}
+	item.ExternalID = strings.TrimSpace(item.ExternalID)
+	if mb.ExternalID != "" {
+		item.ExternalID = mb.ExternalID
+	}
+	if mb.RelatedExternalID != "" {
+		item.RelatedExternalID = mb.RelatedExternalID
+	}
+	if item.ExternalID == "" && item.RelatedExternalID == "" {
+		return s.resolveScrapeCoverID(item, coverartarchive.ErrNoCover)
 	}
 	httpClient, baseURL := s.scrapeProviderHTTP("coverartarchive")
 	clientOptions := []coverartarchive.Option{coverartarchive.WithTimeout(time.Duration(settings.RequestTimeoutSeconds) * time.Second)}
@@ -382,16 +431,20 @@ func (s *Service) scrapeCoverArt(ctx context.Context, item *ScrapeItem, settings
 	if baseURL != "" {
 		clientOptions = append(clientOptions, coverartarchive.WithBaseURL(baseURL))
 	}
-	data, mimeType, err := coverartarchive.NewClient(clientOptions...).Front(ctx, item.ExternalID)
+	covers, err := coverartarchive.NewClient(clientOptions...).Covers(ctx, item.ExternalID, item.RelatedExternalID, scrapeTitleResultLimit)
+	if errors.Is(err, coverartarchive.ErrNoCover) && item.RelatedExternalID == "" && slices.Contains(musicBrainzUnfinishedStates, mb.State) {
+		mbConfig, configErr := s.providerConfig("musicbrainz")
+		if configErr != nil {
+			return configErr
+		}
+		if mbConfig.Enabled && !mbConfig.Paused {
+			return errScrapeDependency
+		}
+	}
 	if err != nil {
 		return err
 	}
-	added, err := s.appendScrapeCover(item.ServerFileID, data, mimeType, "coverartarchive")
-	if err != nil {
-		return err
-	}
-	item.AddedCount += added
-	return nil
+	return s.storeScrapeCovers(item, covers)
 }
 
 func (s *Service) scrapeFanartTV(ctx context.Context, item *ScrapeItem, settings ScrapeSettings) error {
@@ -416,16 +469,11 @@ func (s *Service) scrapeFanartTV(ctx context.Context, item *ScrapeItem, settings
 	if baseURL != "" {
 		options = append(options, fanarttv.WithBaseURL(baseURL))
 	}
-	data, mimeType, err := fanarttv.NewClient(options...).AlbumCover(ctx, item.ExternalID)
+	covers, err := fanarttv.NewClient(options...).AlbumCovers(ctx, item.ExternalID, scrapeTitleResultLimit)
 	if err != nil {
 		return err
 	}
-	added, err := s.appendScrapeCover(item.ServerFileID, data, mimeType, "fanarttv")
-	if err != nil {
-		return err
-	}
-	item.AddedCount += added
-	return nil
+	return s.storeScrapeCovers(item, covers)
 }
 
 func (s *Service) resolveScrapeCoverID(item *ScrapeItem, noCover error) error {
@@ -461,7 +509,7 @@ func (s *Service) resolveScrapeCoverID(item *ScrapeItem, noCover error) error {
 		return errScrapeDependency
 	}
 	if item.Provider == "fanarttv" && !config.Paused && musicBrainzItem.State == ScrapeSuccess && musicBrainzItem.ExternalID != "" {
-		if err := s.ensureFanartMusicBrainzReleaseGroups(); err != nil {
+		if err := s.ensureMusicBrainzReleaseGroups(); err != nil {
 			return err
 		}
 		return errScrapeDependency
@@ -516,29 +564,11 @@ func (s *Service) scrapeLyrics(ctx context.Context, item *ScrapeItem, settings S
 	if title == "" {
 		return lrclib.ErrInvalidQuery
 	}
-	client := s.newLyricsClient(settings)
-	if artist == "" {
-		return s.scrapeLyricsByTitle(ctx, item, client, title, album)
-	}
-	result, err := client.Get(ctx, title, artist, album)
+	duration, err := s.scrapeTrackDuration(file.ServerFileID)
 	if err != nil {
 		return err
 	}
-	if result.SyncedLyrics != "" {
-		n, e := s.appendScrapeResource(item.ServerFileID, "lyrics", "lrc", result.SyncedLyrics, "lrclib", "")
-		if e != nil {
-			return e
-		}
-		item.AddedCount += n
-	}
-	if result.PlainLyrics != "" {
-		n, e := s.appendScrapeResource(item.ServerFileID, "lyrics", "plain", result.PlainLyrics, "lrclib", "")
-		if e != nil {
-			return e
-		}
-		item.AddedCount += n
-	}
-	return nil
+	return s.scrapeLRCLIBCandidates(ctx, item, s.newLyricsClient(settings), title, artist, album, duration)
 }
 
 func (s *Service) scrapeTheAudioDB(ctx context.Context, item *ScrapeItem, settings ScrapeSettings) error {
@@ -566,30 +596,30 @@ func (s *Service) scrapeTheAudioDB(ctx context.Context, item *ScrapeItem, settin
 		options = append(options, theaudiodb.WithBaseURL(baseURL))
 	}
 	client := theaudiodb.NewClient(options...)
-	if artist == "" || album == "" {
+	if album == "" {
 		if title == "" {
 			return theaudiodb.ErrNoMatch
 		}
-		return s.scrapeCoversByTitle(ctx, item, settings, client, title, artist, album)
+		return s.scrapeAlbumsByTitle(ctx, item, settings, client, title, artist, album)
 	}
-	result, err := s.fetchScrapeAlbum(ctx, client, artist, album)
-	if err != nil {
+	results, lookupErr := s.fetchScrapeAlbums(ctx, client, artist, album)
+	if err := s.storeScrapeAlbums(item, title, results); err != nil {
 		return err
 	}
-	data, _ := json.Marshal(metadataSnapshot{Title: file.Title, Artist: result.Artist, Album: result.Album})
-	n, err := s.appendScrapeResource(item.ServerFileID, "metadata", "json", string(data), "theaudiodb", "")
-	if err != nil {
-		return err
-	}
-	item.AddedCount += n
-	if len(result.Cover) > 0 {
-		n, err = s.appendScrapeCover(item.ServerFileID, result.Cover, result.MIME, "theaudiodb")
-		if err != nil {
+	hasCover := slices.ContainsFunc(results, func(result theaudiodb.Result) bool { return len(result.Cover) > 0 })
+	if !hasCover && title != "" {
+		err := s.scrapeAlbumsByTitle(ctx, item, settings, client, title, artist, album)
+		if err == nil {
+			return nil
+		}
+		if len(results) == 0 && !errors.Is(err, theaudiodb.ErrNoMatch) {
 			return err
 		}
-		item.AddedCount += n
 	}
-	return nil
+	if len(results) > 0 {
+		return nil
+	}
+	return lookupErr
 }
 
 // lyricsQuery uses the file's selected metadata. A saved MusicBrainz result
@@ -677,6 +707,17 @@ func (s *Service) appendScrapeResource(fileID, kind, format, data, source, langu
 	return 1, nil
 }
 
+func (s *Service) storeScrapeCovers(item *ScrapeItem, covers []thirdparty.Artwork) error {
+	for _, cover := range slices.Backward(covers) {
+		added, err := s.appendScrapeCover(item.ServerFileID, cover.Data, cover.MIME, item.Provider)
+		if err != nil {
+			return err
+		}
+		item.AddedCount += added
+	}
+	return nil
+}
+
 func (s *Service) appendScrapeCover(fileID string, data []byte, mimeType, source string) (int, error) {
 	if int64(len(data)) > maxCoverSize {
 		return 0, errors.New("scraped cover exceeds size limit")
@@ -709,6 +750,7 @@ func (s *Service) finishScrapeSuccess(item *ScrapeItem) error {
 		"state": ScrapeSuccess, "finished_at": now, "lease_until": nil,
 		"external_id": item.ExternalID, "related_external_id": item.RelatedExternalID, "added_count": item.AddedCount,
 		"dependency_wait_count": 0, "failure_count": 0, "next_retry_at": nil, "last_error": "", "last_error_code": "",
+		"candidate_version": scrapeCandidateVersion,
 	}).Error
 }
 func (s *Service) finishScrapeNoMatch(item *ScrapeItem, err error) error {

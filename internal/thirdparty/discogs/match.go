@@ -73,10 +73,10 @@ func (q matchQuery) releasePriority(summary string) int {
 	return priority
 }
 
-func (q matchQuery) match(release release, releaseURL string) []trackMatch {
+func (q matchQuery) match(release release, releaseURL string, alternatives bool) []trackMatch {
 	album := strings.TrimSpace(release.Title)
 	albumMatch := q.Album != "" && normalizeText(album) == q.Album
-	if q.Artist == "" && (!albumMatch || (q.AlbumArtist != "" && creditRank(q.AlbumArtist, release.Artists) == 0)) {
+	if !alternatives && q.Artist == "" && (!albumMatch || (q.AlbumArtist != "" && creditRank(q.AlbumArtist, release.Artists) == 0)) {
 		return nil
 	}
 	var matches []trackMatch
@@ -93,14 +93,14 @@ func (q matchQuery) match(release release, releaseURL string) []trackMatch {
 			continue
 		}
 		rank := creditRank(q.Artist, artists)
-		if q.Artist != "" && rank == 0 {
+		if !alternatives && q.Artist != "" && rank == 0 {
 			continue
 		}
 		diff := time.Duration(-1)
 		if duration := trackDuration(track.Duration); q.Duration > 0 && duration > 0 {
 			diff = max(q.Duration-duration, duration-q.Duration)
 			tolerance := min(30*time.Second, max(12*time.Second, q.Duration/10))
-			if diff > tolerance {
+			if !alternatives && diff > tolerance {
 				continue
 			}
 		}
@@ -119,18 +119,7 @@ func (q matchQuery) bestMatch(matches []trackMatch) (Result, error) {
 	if len(matches) == 0 {
 		return Result{}, ErrNoMatch
 	}
-	slices.SortStableFunc(matches, func(a, b trackMatch) int {
-		if a.albumMatch != b.albumMatch {
-			if a.albumMatch {
-				return -1
-			}
-			return 1
-		}
-		if rank := cmp.Compare(b.artistRank, a.artistRank); rank != 0 {
-			return rank
-		}
-		return cmp.Compare(matchDistance(a), matchDistance(b))
-	})
+	sortMatches(matches)
 	best := matches[0]
 	for _, other := range matches[1:] {
 		if best.albumMatch == other.albumMatch && differentArtists(best, other) &&
@@ -150,6 +139,21 @@ func (q matchQuery) bestMatch(matches []trackMatch) (Result, error) {
 		}
 	}
 	return best.Result, nil
+}
+
+func sortMatches(matches []trackMatch) {
+	slices.SortStableFunc(matches, func(a, b trackMatch) int {
+		if a.albumMatch != b.albumMatch {
+			if a.albumMatch {
+				return -1
+			}
+			return 1
+		}
+		if rank := cmp.Compare(b.artistRank, a.artistRank); rank != 0 {
+			return rank
+		}
+		return cmp.Compare(matchDistance(a), matchDistance(b))
+	})
 }
 
 func differentArtists(a, b trackMatch) bool {

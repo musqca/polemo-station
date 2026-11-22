@@ -49,6 +49,7 @@ type ScrapeItem struct {
 	FinishedAt          *time.Time `json:"finishedAt,omitempty"`
 	LeaseUntil          *time.Time `gorm:"index" json:"leaseUntil,omitempty"`
 	AddedCount          int        `json:"addedCount"`
+	CandidateVersion    int        `gorm:"default:0" json:"-"`
 	CreatedAt           time.Time  `json:"createdAt"`
 	UpdatedAt           time.Time  `json:"updatedAt"`
 

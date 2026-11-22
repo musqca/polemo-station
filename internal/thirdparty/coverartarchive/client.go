@@ -2,6 +2,7 @@ package coverartarchive
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,9 +10,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/musqca/polemo-station/internal/thirdparty"
 	"github.com/wonli/apic/v2"
 )
 
@@ -79,41 +82,73 @@ func (c *Client) buildCandidateURLs(img *responseImage) []string {
 }
 
 func (c *Client) Front(ctx context.Context, releaseID string) ([]byte, string, error) {
-	releaseID = strings.TrimSpace(releaseID)
-	if releaseID == "" {
-		return nil, "", errors.New("cover art release id is empty")
-	}
-	var listing response
-	if err := (&endpoint{client: c, path: "/release/" + releaseID}).call(ctx, &listing); err != nil {
+	covers, err := c.Covers(ctx, releaseID, "", 1)
+	if err != nil {
 		return nil, "", err
 	}
-	var selected *responseImage
-	for i := range listing.Images {
-		img := &listing.Images[i]
-		if img.Front && img.Approved {
-			selected = img
-			break
+	return covers[0].Data, covers[0].MIME, nil
+}
+
+func (c *Client) Covers(ctx context.Context, releaseID, groupID string, limit int) ([]thirdparty.Artwork, error) {
+	var covers []thirdparty.Artwork
+	var lastErr error
+	seen := make(map[string]bool)
+	for _, target := range []struct{ kind, id string }{{"release", releaseID}, {"release-group", groupID}} {
+		id := strings.TrimSpace(target.id)
+		if id == "" || len(covers) >= limit {
+			continue
 		}
-	}
-	if selected == nil {
-		for i := range listing.Images {
-			img := &listing.Images[i]
-			if img.Front {
-				selected = img
+		var listing response
+		if err := (&endpoint{client: c, path: "/" + target.kind + "/" + url.PathEscape(id)}).call(ctx, &listing); err != nil {
+			if !errors.Is(err, ErrNoCover) {
+				lastErr = err
+			}
+			continue
+		}
+		priority := func(image responseImage) int {
+			if image.Front && image.Approved {
+				return 2
+			}
+			if image.Front {
+				return 1
+			}
+			return 0
+		}
+		slices.SortStableFunc(listing.Images, func(a, b responseImage) int { return cmp.Compare(priority(b), priority(a)) })
+		for index, image := range listing.Images {
+			// If an edition supplies no working front, keep one usable alternate image.
+			if len(covers) >= limit || index >= 6 || (len(covers) > 0 && !image.Front) {
 				break
+			}
+			if image.Image != "" && seen[image.Image] {
+				continue
+			}
+			cover, err := c.downloadArtwork(ctx, &image)
+			if err != nil {
+				if !errors.Is(err, ErrNoCover) {
+					lastErr = err
+				}
+				continue
+			}
+			seen[image.Image] = true
+			if !slices.ContainsFunc(covers, func(other thirdparty.Artwork) bool { return bytes.Equal(other.Data, cover.Data) }) {
+				covers = append(covers, cover)
 			}
 		}
 	}
-	if selected == nil && len(listing.Images) > 0 {
-		selected = &listing.Images[0]
+	if len(covers) > 0 {
+		return covers, nil
 	}
-	if selected == nil {
-		return nil, "", ErrNoCover
+	if lastErr != nil {
+		return nil, lastErr
 	}
+	return nil, ErrNoCover
+}
 
+func (c *Client) downloadArtwork(ctx context.Context, selected *responseImage) (thirdparty.Artwork, error) {
 	candidates := c.buildCandidateURLs(selected)
 	if len(candidates) == 0 {
-		return nil, "", ErrNoCover
+		return thirdparty.Artwork{}, ErrNoCover
 	}
 
 	var lastErr error
@@ -132,12 +167,12 @@ func (c *Client) Front(ctx context.Context, releaseID string) ([]byte, string, e
 			lastErr = fmt.Errorf("cover art has unsupported content type %s", mime)
 			continue
 		}
-		return data, mime, nil
+		return thirdparty.Artwork{Data: data, MIME: mime}, nil
 	}
 	if lastErr != nil {
-		return nil, "", lastErr
+		return thirdparty.Artwork{}, lastErr
 	}
-	return nil, "", ErrNoCover
+	return thirdparty.Artwork{}, ErrNoCover
 }
 
 // Check performs a read-only request against the service root. It does not

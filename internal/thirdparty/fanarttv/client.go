@@ -1,15 +1,18 @@
 package fanarttv
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/musqca/polemo-station/internal/thirdparty"
 	"github.com/wonli/apic/v2"
 )
 
@@ -41,13 +44,13 @@ func NewClient(opts ...Option) *Client {
 	return c
 }
 
-// AlbumCover retrieves Fanart.tv artwork for a MusicBrainz release-group ID.
-func (c *Client) AlbumCover(ctx context.Context, releaseGroupID string) ([]byte, string, error) {
+// AlbumCovers retrieves Fanart.tv artwork for a MusicBrainz release-group ID.
+func (c *Client) AlbumCovers(ctx context.Context, releaseGroupID string, limit int) ([]thirdparty.Artwork, error) {
 	if strings.TrimSpace(c.apiKey) == "" {
-		return nil, "", errors.New("fanart.tv API key is required")
+		return nil, errors.New("fanart.tv API key is required")
 	}
 	if strings.TrimSpace(releaseGroupID) == "" {
-		return nil, "", ErrNoCover
+		return nil, ErrNoCover
 	}
 	var listing struct {
 		Albums []struct {
@@ -58,25 +61,53 @@ func (c *Client) AlbumCover(ctx context.Context, releaseGroupID string) ([]byte,
 		} `json:"albums"`
 	}
 	if err := (&endpoint{client: c, path: "/music/albums/" + url.PathEscape(releaseGroupID), accept: "application/json"}).call(ctx, &listing); err != nil {
-		return nil, "", err
+		return nil, err
 	}
+	var covers []thirdparty.Artwork
+	var lastErr error
+	seen := make(map[string]bool)
 	for _, album := range listing.Albums {
 		for _, cover := range album.AlbumCover {
-			if strings.TrimSpace(cover.URL) == "" {
+			value := strings.TrimSpace(cover.URL)
+			if value == "" || seen[value] {
 				continue
 			}
+			if len(seen) >= limit*2 || len(covers) >= limit || ctx.Err() != nil {
+				break
+			}
+			seen[value] = true
 			var data []byte
-			if err := (&endpoint{client: c, rawURL: cover.URL, accept: "image/avif,image/webp,image/png,image/jpeg,*/*;q=0.8"}).call(ctx, &data); err != nil {
-				return nil, "", err
+			if err := (&endpoint{client: c, rawURL: value, accept: "image/png,image/jpeg"}).call(ctx, &data); err != nil {
+				if !errors.Is(err, ErrNoCover) {
+					lastErr = err
+				}
+				continue
 			}
 			mime := http.DetectContentType(data)
 			if mime != "image/jpeg" && mime != "image/png" {
-				return nil, "", fmt.Errorf("fanart.tv cover has unsupported content type %s", mime)
+				lastErr = fmt.Errorf("fanart.tv cover has unsupported content type %s", mime)
+				continue
 			}
-			return data, mime, nil
+			if len(data) <= 30<<20 && !slices.ContainsFunc(covers, func(other thirdparty.Artwork) bool { return bytes.Equal(other.Data, data) }) {
+				covers = append(covers, thirdparty.Artwork{Data: data, MIME: mime})
+			}
 		}
 	}
-	return nil, "", ErrNoCover
+	if len(covers) > 0 {
+		return covers, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, ErrNoCover
+}
+
+func (c *Client) AlbumCover(ctx context.Context, releaseGroupID string) ([]byte, string, error) {
+	covers, err := c.AlbumCovers(ctx, releaseGroupID, 1)
+	if err != nil {
+		return nil, "", err
+	}
+	return covers[0].Data, covers[0].MIME, nil
 }
 
 // Check validates the configured key without downloading artwork.
@@ -103,7 +134,11 @@ func (e *endpoint) Url() string {
 func (e *endpoint) Path() string      { return "" }
 func (e *endpoint) Query() url.Values { return nil }
 func (e *endpoint) Headers() apic.Params {
-	return apic.Params{"Accept": e.accept, "User-Agent": "Polemo Station/1.0", "client-key": e.client.apiKey}
+	headers := apic.Params{"Accept": e.accept, "User-Agent": "Polemo Station/1.0"}
+	if e.rawURL == "" {
+		headers["client-key"] = e.client.apiKey
+	}
+	return headers
 }
 func (e *endpoint) PostBody() any                      { return nil }
 func (e *endpoint) FormData() any                      { return nil }

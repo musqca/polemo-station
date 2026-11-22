@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -48,7 +49,7 @@ type Result struct {
 var ErrNoMatch = errors.New("lrclib lyrics not found")
 var ErrInvalidQuery = errors.New("lrclib query requires track title and artist")
 
-func (c *Client) Get(ctx context.Context, title, artist, album string) (Result, error) {
+func (c *Client) Get(ctx context.Context, title, artist, album string, durationSeconds ...int) (Result, error) {
 	title, artist, album = strings.TrimSpace(title), strings.TrimSpace(artist), strings.TrimSpace(album)
 	if title == "" || artist == "" {
 		return Result{}, ErrInvalidQuery
@@ -56,6 +57,9 @@ func (c *Client) Get(ctx context.Context, title, artist, album string) (Result, 
 	query := url.Values{"track_name": {title}, "artist_name": {artist}}
 	if album != "" {
 		query.Set("album_name", album)
+	}
+	if len(durationSeconds) > 0 && durationSeconds[0] >= 1 && durationSeconds[0] <= 3600 {
+		query.Set("duration", strconv.Itoa(durationSeconds[0]))
 	}
 	var result Result
 	if err := c.query(ctx, "/api/get", query, &result); err != nil {
